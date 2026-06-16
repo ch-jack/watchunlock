@@ -18,9 +18,11 @@ const configPath = path.join(dataRoot, "config.json");
 const statePath = path.join(dataRoot, "state.json");
 const monitorPidPath = path.join(runtimeDir, "monitor.pid");
 const monitorLogPath = path.join(runtimeDir, "monitor.log");
+const monitorSignalPath = path.join(runtimeDir, "monitor-signal.json");
 const port = Number(process.env.WATCHUNLOCK_WEB_PORT || process.argv[2] || 8765);
 const host = "127.0.0.1";
 const token = crypto.randomBytes(24).toString("hex");
+let monitorChild = null;
 
 fs.mkdirSync(runtimeDir, { recursive: true });
 
@@ -107,7 +109,7 @@ function runWatchUnlock(args, options = {}) {
 }
 
 function parseJsonOutput(result, fallback = null) {
-  const text = result.stdout.trim();
+  const text = result.stdout.replace(/^\uFEFF/, "").trim();
   if (!text) return fallback;
   try {
     return JSON.parse(text);
@@ -118,7 +120,7 @@ function parseJsonOutput(result, fallback = null) {
 
 function readJsonFile(filePath) {
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
   } catch {
     return null;
   }
@@ -176,16 +178,39 @@ async function providerStatus() {
 
 function monitorStatus() {
   const pid = readPid();
-  const running = isPidRunning(pid);
+  const childRunning = monitorChild && monitorChild.pid && !monitorChild.killed;
+  const running = childRunning || isPidRunning(pid);
   if (pid && !running) {
     try { fs.unlinkSync(monitorPidPath); } catch {}
   }
-  return { running, pid: running ? pid : null, logPath: monitorLogPath };
+  const state = readJsonFile(monitorSignalPath) || readJsonFile(statePath) || {};
+  const ageSeconds = state.lastSeenAt ? Math.max(0, Math.round(Date.now() / 1000 - Number(state.lastSeenAt))) : null;
+  return {
+    running,
+    pid: running ? pid : null,
+    logPath: monitorLogPath,
+    signalPath: monitorSignalPath,
+    signal: {
+      address: state.address || "",
+      rssi: Number.isFinite(Number(state.rssi)) ? Number(state.rssi) : null,
+      bestRssi: Number.isFinite(Number(state.bestRssi)) ? Number(state.bestRssi) : null,
+      presence: state.presence || "",
+      nearHits: Number.isFinite(Number(state.nearHits)) ? Number(state.nearHits) : 0,
+      lastSeenAt: state.lastSeenAt || null,
+      lastSeenIso: state.lastSeenIso || "",
+      ageSeconds,
+    },
+  };
 }
 
 function appendLogHeader() {
   fs.mkdirSync(runtimeDir, { recursive: true });
   fs.appendFileSync(monitorLogPath, `\n--- monitor start ${new Date().toISOString()} ---\n`, "utf8");
+}
+
+function appendMonitorLogLine(text) {
+  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.appendFileSync(monitorLogPath, `${text}\n`, "utf8");
 }
 
 function startMonitor() {
@@ -194,9 +219,8 @@ function startMonitor() {
     return current;
   }
   appendLogHeader();
-  const out = fs.openSync(monitorLogPath, "a");
-  const err = fs.openSync(monitorLogPath, "a");
-  const child = spawn("powershell.exe", [
+  try { fs.unlinkSync(monitorSignalPath); } catch {}
+  const args = [
     "-NoProfile",
     "-ExecutionPolicy",
     "Bypass",
@@ -205,13 +229,29 @@ function startMonitor() {
     "monitor",
     "-LogFile",
     monitorLogPath,
-  ], {
+    "-SignalStatePath",
+    monitorSignalPath,
+  ];
+  appendMonitorLogLine(`[web][monitor] spawn powershell.exe ${args.map(arg => `"${arg}"`).join(" ")}`);
+  const child = spawn("powershell.exe", args, {
     cwd: rootDir,
-    detached: true,
     windowsHide: true,
-    stdio: ["ignore", out, err],
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  child.unref();
+  monitorChild = child;
+  child.stdout.resume();
+  child.stderr.on("data", data => appendMonitorLogLine(data.toString().trimEnd()));
+  child.on("error", error => {
+    appendMonitorLogLine(`[web][monitor] failed to start: ${error.message}`);
+  });
+  child.on("exit", (code, signal) => {
+    appendMonitorLogLine(`[web][monitor] exited code=${code ?? ""} signal=${signal ?? ""}`);
+    if (monitorChild === child) monitorChild = null;
+    try {
+      const currentPid = fs.readFileSync(monitorPidPath, "utf8").trim();
+      if (currentPid === String(child.pid)) fs.unlinkSync(monitorPidPath);
+    } catch {}
+  });
   fs.writeFileSync(monitorPidPath, String(child.pid), "utf8");
   return { running: true, pid: child.pid, logPath: monitorLogPath };
 }
@@ -220,6 +260,7 @@ async function stopMonitor() {
   const pid = readPid();
   if (!pid) return monitorStatus();
   await runCommand("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { timeoutMs: 10000 });
+  if (monitorChild && monitorChild.pid === pid) monitorChild = null;
   try { fs.unlinkSync(monitorPidPath); } catch {}
   return monitorStatus();
 }
@@ -255,6 +296,11 @@ function normalizeIrk(value) {
   return String(value || "").replace(/[^0-9a-f]/gi, "").toUpperCase();
 }
 
+function reverseHexBytes(hex) {
+  const clean = normalizeIrk(hex);
+  return clean.match(/../g)?.reverse().join("") || "";
+}
+
 async function handleApi(req, res, url) {
   if (!requireToken(req, res)) return;
 
@@ -270,11 +316,33 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/keys") {
-    const result = await runWatchUnlock(["keys", "-Json"], { timeoutMs: 20000 });
-    const data = parseJsonOutput(result, null);
+    let result = await runWatchUnlock(["keys", "-Json"], { timeoutMs: 20000 });
+    let data = parseJsonOutput(result, null);
+    let usedSystem = false;
+    if ((!Array.isArray(data) || data.length === 0) && /Cannot read Bluetooth key registry path|不允许所请求的注册表访问权|Access is denied/i.test(`${result.stdout}${result.stderr}`)) {
+      const systemResult = await runWatchUnlock(["keys-system", "-Json"], { timeoutMs: 45000 });
+      const systemData = parseJsonOutput(systemResult, null);
+      if (Array.isArray(systemData)) {
+        result = systemResult;
+        data = systemData;
+        usedSystem = true;
+      }
+    }
     sendJson(res, 200, {
       ok: result.code === 0 && Array.isArray(data),
       keys: Array.isArray(data) ? data : [],
+      usedSystem,
+      output: `${result.stdout}${result.stderr}`.trim(),
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/paired") {
+    const result = await runWatchUnlock(["paired", "-Json"], { timeoutMs: 20000 });
+    const data = parseJsonOutput(result, null);
+    sendJson(res, 200, {
+      ok: result.code === 0 && Array.isArray(data),
+      devices: Array.isArray(data) ? data : [],
       output: `${result.stdout}${result.stderr}`.trim(),
     });
     return;
@@ -303,9 +371,28 @@ async function handleApi(req, res, url) {
       return;
     }
     const seconds = safeInt(body.seconds, 15, 1, 120);
-    const result = await runWatchUnlock(["resolve", "-Irk", irk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
-    const matches = parseJsonOutput(result, []);
-    sendJson(res, 200, { ok: result.code === 0, matches: Array.isArray(matches) ? matches : [], output: `${result.stdout}${result.stderr}`.trim() });
+    let result = await runWatchUnlock(["resolve", "-Irk", irk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
+    let matches = parseJsonOutput(result, []);
+    let irkUsed = irk;
+    let variant = "normal";
+    const reversedIrk = reverseHexBytes(irk);
+    if ((!Array.isArray(matches) || matches.length === 0) && reversedIrk.length === 32 && reversedIrk !== irk) {
+      const reversedResult = await runWatchUnlock(["resolve", "-Irk", reversedIrk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
+      const reversedMatches = parseJsonOutput(reversedResult, []);
+      if (Array.isArray(reversedMatches) && reversedMatches.length > 0) {
+        result = reversedResult;
+        matches = reversedMatches;
+        irkUsed = reversedIrk;
+        variant = "reversed";
+      }
+    }
+    sendJson(res, 200, {
+      ok: result.code === 0,
+      matches: Array.isArray(matches) ? matches : [],
+      irkUsed,
+      variant,
+      output: `${result.stdout}${result.stderr}`.trim(),
+    });
     return;
   }
 

@@ -2,6 +2,8 @@
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $ScriptName = Split-Path -Leaf $PSCommandPath
 $DefaultDataRoot = if ([string]::IsNullOrWhiteSpace($env:ProgramData)) {
@@ -23,7 +25,11 @@ Usage:
 Commands:
   help       Show this help.
   scan       Scan nearby BLE advertisements.
+  scan-test  Check BLE watcher status and event count.
+  paired     List paired Bluetooth/BLE devices known to Windows.
   keys       Try to list paired Bluetooth LE IRKs from the Windows registry.
+  keys-system
+             Run a one-shot SYSTEM task to read paired Bluetooth LE IRKs.
   resolve    Scan and print advertisements matching an IRK.
   init       Save monitor defaults to %ProgramData%\WatchUnlockCli\config.json.
   remove-device
@@ -42,6 +48,7 @@ Common options:
   -Irk <hex>             16-byte IRK as 32 hex chars. Separators are allowed.
   -Seconds <n>           Scan duration. Default: 20 for scan, 60 for resolve.
   -RssiMin <dbm>         Ignore advertisements weaker than this. Default: -100.
+  -Active                Use active BLE scanning. Default is passive scanning.
   -Json                  Emit JSON instead of table/log lines.
   -Config <path>         Config path. Default: $DefaultConfigPath
 
@@ -180,6 +187,17 @@ function Get-BoolOption {
     return @("1", "true", "yes", "y", "on") -contains $text
 }
 
+function Test-IsAdministrator {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Normalize-Hex {
     param(
         [Parameter(Mandatory = $true)][string]$Value,
@@ -288,14 +306,132 @@ function Get-AdvertisementInfo {
 function Ensure-BluetoothRuntime {
     $null = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
     $null = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.BluetoothLEDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Bluetooth.BluetoothDevice, Windows.Devices.Bluetooth, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Enumeration.DeviceInformation, Windows.Devices.Enumeration, ContentType = WindowsRuntime]
+    $null = [Windows.Devices.Enumeration.DeviceInformationCollection, Windows.Devices.Enumeration, ContentType = WindowsRuntime]
+}
+
+function Wait-WinRtAsyncOperation {
+    param($Operation, [Type]$ResultType)
+
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $method = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+        Where-Object {
+            $_.Name -eq "AsTask" -and
+            $_.IsGenericMethodDefinition -and
+            $_.GetParameters().Count -eq 1 -and
+            $_.GetParameters()[0].ParameterType.Name -like "IAsyncOperation*"
+        } |
+        Select-Object -First 1
+
+    if ($null -eq $method) {
+        throw "Cannot find WinRT AsTask helper."
+    }
+
+    $task = $method.MakeGenericMethod($ResultType).Invoke($null, @($Operation))
+    $task.Wait()
+    return $task.Result
+}
+
+function Get-PairedBluetoothDevicesFromSelector {
+    param([string]$Selector, [string]$Kind)
+
+    $rows = New-Object System.Collections.ArrayList
+    if ([string]::IsNullOrWhiteSpace($Selector)) {
+        return @()
+    }
+
+    $operation = [Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync($Selector)
+    $devices = Wait-WinRtAsyncOperation -Operation $operation -ResultType ([Windows.Devices.Enumeration.DeviceInformationCollection])
+
+    foreach ($device in @($devices)) {
+        [void]$rows.Add([pscustomobject]@{
+            kind      = $Kind
+            name      = [string]$device.Name
+            id        = [string]$device.Id
+            address   = Get-BluetoothAddressFromDeviceId -DeviceId ([string]$device.Id)
+            isEnabled = [bool]$device.IsEnabled
+            isPaired  = [bool]$device.Pairing.IsPaired
+        })
+    }
+
+    return @($rows)
+}
+
+function Get-BluetoothAddressFromDeviceId {
+    param([string]$DeviceId)
+
+    if ([string]::IsNullOrWhiteSpace($DeviceId)) {
+        return ""
+    }
+
+    $tail = (($DeviceId -split "-") | Select-Object -Last 1)
+    $colonMatch = [regex]::Match($tail, "(?i)([0-9A-F]{2}(?::[0-9A-F]{2}){5})")
+    if ($colonMatch.Success) {
+        return $colonMatch.Groups[1].Value.ToUpperInvariant()
+    }
+
+    $match = [regex]::Match($DeviceId, "(?i)(?:Dev_|BluetoothDevice_|_)([0-9A-F]{12})(?:\\|$|_)")
+    if (-not $match.Success) {
+        $match = [regex]::Match($DeviceId, "(?i)([0-9A-F]{12})")
+    }
+    if (-not $match.Success) {
+        return ""
+    }
+
+    $hex = $match.Groups[1].Value.ToUpperInvariant()
+    return (($hex -split "(.{2})" | Where-Object { $_ }) -join ":")
+}
+
+function Get-RegistryPairedBluetoothDevices {
+    $root = "Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Enum\BTHENUM"
+    $rows = New-Object System.Collections.ArrayList
+
+    if (-not (Test-Path $root)) {
+        return @()
+    }
+
+    foreach ($deviceRoot in @(Get-ChildItem -Path $root -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "Dev_*" })) {
+        foreach ($instance in @(Get-ChildItem -Path $deviceRoot.PSPath -ErrorAction SilentlyContinue)) {
+            $props = Get-ItemProperty -Path $instance.PSPath -ErrorAction SilentlyContinue
+            if ($null -eq $props) {
+                continue
+            }
+
+            $name = [string]$props.FriendlyName
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $name = [string]$props.DeviceDesc
+            }
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                continue
+            }
+
+            [void]$rows.Add([pscustomobject]@{
+                kind      = "Registry"
+                name      = $name
+                id        = [string]$instance.PSChildName
+                address   = Get-BluetoothAddressFromDeviceId -DeviceId ([string]$instance.PSChildName)
+                isEnabled = $true
+                isPaired  = $true
+            })
+        }
+    }
+
+    return @($rows)
 }
 
 function Start-BleWatcher {
-    param([string]$SourceIdentifier)
+    param([string]$SourceIdentifier, [bool]$Active = $false)
 
     Ensure-BluetoothRuntime
     $watcher = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher]::new()
-    $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode]::Active
+    if ($Active) {
+        $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode]::Active
+    }
+    else {
+        $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode]::Passive
+    }
     $queue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
     $handler = [Windows.Foundation.TypedEventHandler[Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher, Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementReceivedEventArgs]]{
         param($sender, $eventArgs)
@@ -537,7 +673,7 @@ function Write-JsonArray {
         return
     }
 
-    @($Items) | ConvertTo-Json -Depth $Depth
+    ConvertTo-Json -InputObject @($Items) -Depth $Depth
 }
 
 function Get-Config {
@@ -664,6 +800,36 @@ function Clear-ProviderUnlockState {
     } | ConvertTo-Json -Depth 4 | Set-Content -Path $StatePath -Encoding UTF8
 }
 
+function Set-MonitorSignalState {
+    param(
+        [string]$StatePath,
+        [string]$Address,
+        [int]$Rssi,
+        [int]$BestRssi,
+        [string]$Presence,
+        [int]$NearHits
+    )
+
+    $folder = Split-Path -Parent $StatePath
+    if (-not [string]::IsNullOrWhiteSpace($folder) -and -not (Test-Path $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    }
+
+    $now = [DateTimeOffset]::Now
+    [ordered]@{
+        allowUnlockUntil = 0
+        unlockToken      = ""
+        lastNearAt       = 0
+        lastSeenAt       = $now.ToUnixTimeSeconds()
+        lastSeenIso      = $now.ToString("o")
+        address          = $Address
+        rssi             = $Rssi
+        bestRssi         = $BestRssi
+        presence         = $Presence
+        nearHits         = $NearHits
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $StatePath -Encoding UTF8
+}
+
 function Invoke-ScanCommand {
     param([hashtable]$Options)
 
@@ -671,6 +837,7 @@ function Invoke-ScanCommand {
     $rssiMin = Get-IntOption -Options $Options -Names @("rssimin", "rssi-min") -Default -100
     $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
     $continuous = Get-BoolOption -Options $Options -Names @("continuous") -Default $false
+    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
     $sourceId = "watchunlock-scan-$([Guid]::NewGuid().ToString("N"))"
     $watcherInfo = $null
     $seen = @{}
@@ -678,9 +845,10 @@ function Invoke-ScanCommand {
     $deadline = (Get-Date).AddSeconds($seconds)
 
     try {
-        $watcherInfo = Start-BleWatcher -SourceIdentifier $sourceId
+        $watcherInfo = Start-BleWatcher -SourceIdentifier $sourceId -Active $active
         if (-not $json) {
-            Write-Host ("Scanning for {0}s, RSSI >= {1} dBm..." -f $seconds, $rssiMin)
+            $scanType = if ($active) { "active" } else { "passive" }
+            Write-Host ("Scanning for {0}s, RSSI >= {1} dBm, mode={2}..." -f $seconds, $rssiMin, $scanType)
         }
 
         while ((Get-Date) -lt $deadline) {
@@ -717,6 +885,168 @@ function Invoke-ScanCommand {
     }
 }
 
+function Invoke-ScanTestCommand {
+    param([hashtable]$Options)
+
+    $seconds = Get-IntOption -Options $Options -Names @("seconds", "s") -Default 10
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
+    Ensure-BluetoothRuntime
+
+    $watcher = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher]::new()
+    if ($active) {
+        $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode]::Active
+    }
+    else {
+        $watcher.ScanningMode = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEScanningMode]::Passive
+    }
+    $count = 0
+    $lastRssi = $null
+    $lastAddress = ""
+    $stoppedReason = ""
+    $received = [Windows.Foundation.TypedEventHandler[Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher, Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementReceivedEventArgs]]{
+        param($sender, $eventArgs)
+        $script:scanTestCount++
+        $script:scanTestLastRssi = [int]$eventArgs.RawSignalStrengthInDBm
+        $script:scanTestLastAddress = Format-BluetoothAddress -Address ([UInt64]$eventArgs.BluetoothAddress)
+    }
+    $stopped = [Windows.Foundation.TypedEventHandler[Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher, Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcherStoppedEventArgs]]{
+        param($sender, $eventArgs)
+        $script:scanTestStoppedReason = [string]$eventArgs.Error
+    }
+
+    $script:scanTestCount = 0
+    $script:scanTestLastRssi = $null
+    $script:scanTestLastAddress = ""
+    $script:scanTestStoppedReason = ""
+    $receivedToken = $watcher.add_Received($received)
+    $stoppedToken = $watcher.add_Stopped($stopped)
+    $before = [string]$watcher.Status
+    try {
+        $watcher.Start()
+        $afterStart = [string]$watcher.Status
+        Start-Sleep -Seconds $seconds
+        $count = [int]$script:scanTestCount
+        $lastRssi = $script:scanTestLastRssi
+        $lastAddress = [string]$script:scanTestLastAddress
+        $stoppedReason = [string]$script:scanTestStoppedReason
+        $afterWait = [string]$watcher.Status
+    }
+    finally {
+        try { $watcher.Stop() } catch {}
+        Start-Sleep -Milliseconds 200
+        $afterStop = [string]$watcher.Status
+        try { $watcher.remove_Received($receivedToken) } catch {}
+        try { $watcher.remove_Stopped($stoppedToken) } catch {}
+    }
+
+    $row = [pscustomobject]@{
+        seconds       = $seconds
+        mode          = if ($active) { "active" } else { "passive" }
+        before        = $before
+        afterStart    = $afterStart
+        afterWait     = $afterWait
+        afterStop     = $afterStop
+        count         = $count
+        lastAddress   = $lastAddress
+        lastRssi      = $lastRssi
+        stoppedReason = $stoppedReason
+    }
+
+    if ($json) {
+        $row | ConvertTo-Json -Depth 4
+        return
+    }
+
+    "Watcher before: {0}" -f $row.before | Write-Host
+    "Mode: {0}" -f $row.mode | Write-Host
+    "Watcher after start: {0}" -f $row.afterStart | Write-Host
+    "Watcher after wait: {0}" -f $row.afterWait | Write-Host
+    "Events received: {0}" -f $row.count | Write-Host
+    "Last event: {0} {1} dBm" -f $row.lastAddress, $row.lastRssi | Write-Host
+    "Stopped reason: {0}" -f $row.stoppedReason | Write-Host
+}
+
+function Invoke-PairedCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $rows = New-Object System.Collections.ArrayList
+    $seen = @{}
+
+    function Add-PairedRow {
+        param($Row)
+
+        if ($null -eq $Row) {
+            return
+        }
+
+        $address = if ($null -ne $Row.PSObject.Properties["address"]) { [string]$Row.address } else { "" }
+        $id = if ($null -ne $Row.PSObject.Properties["id"]) { [string]$Row.id } else { "" }
+        $name = if ($null -ne $Row.PSObject.Properties["name"]) { [string]$Row.name } else { "" }
+
+        $key = if (-not [string]::IsNullOrWhiteSpace($address)) {
+            $address
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($id)) {
+            $id
+        }
+        else {
+            $name
+        }
+
+        if ([string]::IsNullOrWhiteSpace($key) -or $seen.ContainsKey($key)) {
+            return
+        }
+
+        $seen[$key] = $true
+        [void]$rows.Add($Row)
+    }
+
+    foreach ($row in @(Get-RegistryPairedBluetoothDevices)) {
+        Add-PairedRow -Row $row
+    }
+
+    try {
+        Ensure-BluetoothRuntime
+        $bleSelector = [Windows.Devices.Bluetooth.BluetoothLEDevice]::GetDeviceSelectorFromPairingState($true)
+        foreach ($row in @(Get-PairedBluetoothDevicesFromSelector -Selector $bleSelector -Kind "BLE")) {
+            Add-PairedRow -Row $row
+        }
+    }
+    catch {
+        if (-not $json) {
+            Write-Host ("Cannot list paired BLE devices: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    try {
+        $classicSelector = [Windows.Devices.Bluetooth.BluetoothDevice]::GetDeviceSelectorFromPairingState($true)
+        foreach ($row in @(Get-PairedBluetoothDevicesFromSelector -Selector $classicSelector -Kind "Bluetooth")) {
+            Add-PairedRow -Row $row
+        }
+    }
+    catch {
+        if (-not $json) {
+            Write-Host ("Cannot list paired Bluetooth devices: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    if ($json) {
+        Write-JsonArray -Items $rows -Depth 5
+        return
+    }
+
+    if ($rows.Count -eq 0) {
+        Write-Host "No paired Bluetooth devices found. Windows may still hide IRK/RSSI; use 'scan' for live advertisements and 'keys' for IRK."
+        return
+    }
+
+    foreach ($row in $rows) {
+        "{0,-9} {1,-24} paired={2,-5} enabled={3,-5} {4} {5}" -f $row.kind, $row.name, $row.isPaired, $row.isEnabled, $row.address, $row.id | Write-Host
+    }
+}
+
 function Invoke-ResolveCommand {
     param([hashtable]$Options)
 
@@ -732,6 +1062,7 @@ function Invoke-ResolveCommand {
     $seconds = Get-IntOption -Options $Options -Names @("seconds", "s") -Default 60
     $rssiMin = Get-IntOption -Options $Options -Names @("rssimin", "rssi-min") -Default -100
     $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
     $sourceId = "watchunlock-resolve-$([Guid]::NewGuid().ToString("N"))"
     $watcherInfo = $null
     $seen = @{}
@@ -739,9 +1070,10 @@ function Invoke-ResolveCommand {
     $deadline = (Get-Date).AddSeconds($seconds)
 
     try {
-        $watcherInfo = Start-BleWatcher -SourceIdentifier $sourceId
+        $watcherInfo = Start-BleWatcher -SourceIdentifier $sourceId -Active $active
         if (-not $json) {
-            Write-Host ("Resolving for {0}s, RSSI >= {1} dBm..." -f $seconds, $rssiMin)
+            $scanType = if ($active) { "active" } else { "passive" }
+            Write-Host ("Resolving for {0}s, RSSI >= {1} dBm, mode={2}..." -f $seconds, $rssiMin, $scanType)
         }
 
         while ((Get-Date) -lt $deadline) {
@@ -788,6 +1120,7 @@ function Invoke-KeysCommand {
     param([hashtable]$Options)
 
     $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $noSystem = Get-BoolOption -Options $Options -Names @("nosystem", "no-system") -Default $false
     $root = "Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys"
     $rows = New-Object System.Collections.ArrayList
 
@@ -798,6 +1131,11 @@ function Invoke-KeysCommand {
         $adapters = @(Get-ChildItem -Path $root -ErrorAction Stop)
     }
     catch {
+        if (-not $noSystem) {
+            Invoke-KeysSystemCommand -Options $Options
+            return
+        }
+
         Write-Host "Cannot read Bluetooth key registry path: $root"
         Write-Host ("Reason: {0}" -f $_.Exception.Message)
         Write-Host "Try running PowerShell as Administrator or SYSTEM. The script only reads this path; it does not elevate itself."
@@ -843,6 +1181,98 @@ function Invoke-KeysCommand {
         "Adapter: {0}  Device: {1}" -f $row.adapter, $row.device | Write-Host
         "  IRK:         {0}" -f $row.irk | Write-Host
         "  IRK reverse: {0}" -f $row.irkReversed | Write-Host
+    }
+}
+
+function Invoke-KeysSystemCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $timeoutSeconds = Get-IntOption -Options $Options -Names @("timeout", "timeoutseconds", "timeout-seconds") -Default 20
+    $runtimeRoot = Join-Path (Split-Path -Parent $PSCommandPath) ".runtime"
+
+    $id = [Guid]::NewGuid().ToString("N")
+    $taskName = "WatchUnlock-ReadBluetoothIrk-$id"
+    $outputPath = Join-Path $runtimeRoot "$taskName.json"
+    $errorPath = Join-Path $runtimeRoot "$taskName.err.txt"
+    $scriptPath = $PSCommandPath
+
+    $inner = @"
+try {
+  `$OutputEncoding = [System.Text.UTF8Encoding]::new(`$false)
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(`$false)
+  & '$scriptPath' keys -Json -NoSystem 2> '$errorPath' | Set-Content -Path '$outputPath' -Encoding UTF8
+  exit `$LASTEXITCODE
+}
+catch {
+  `$_.Exception.Message | Set-Content -Path '$errorPath' -Encoding UTF8
+  exit 1
+}
+"@
+
+    try {
+        if (-not (Test-Path $runtimeRoot)) {
+            New-Item -ItemType Directory -Path $runtimeRoot -Force | Out-Null
+        }
+
+        $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($inner))
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
+        $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1))
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+
+        $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+        do {
+            if (Test-Path $outputPath) {
+                break
+            }
+            Start-Sleep -Milliseconds 300
+        } while ((Get-Date) -lt $deadline)
+
+        if (-not (Test-Path $outputPath)) {
+            $message = "Timed out waiting for SYSTEM IRK reader task."
+            if (Test-Path $errorPath) {
+                $errorText = Get-Content -Path $errorPath -Raw -Encoding UTF8
+                if (-not [string]::IsNullOrWhiteSpace($errorText)) {
+                    $message = "$message $errorText"
+                }
+            }
+            throw $message
+        }
+
+        $text = Get-Content -Path $outputPath -Raw -Encoding UTF8
+        if ($json) {
+            Write-Output $text.Trim()
+            return
+        }
+
+        $rows = $text | ConvertFrom-Json
+        if ($null -eq $rows -or @($rows).Count -eq 0) {
+            Write-Host "No IRK values found while running as SYSTEM."
+            return
+        }
+
+        foreach ($row in @($rows)) {
+            "Adapter: {0}  Device: {1}" -f $row.adapter, $row.device | Write-Host
+            "  IRK:         {0}" -f $row.irk | Write-Host
+            "  IRK reverse: {0}" -f $row.irkReversed | Write-Host
+        }
+    }
+    catch {
+        if ($json) {
+            Write-Output "[]"
+        }
+        $adminText = if (Test-IsAdministrator) { "yes" } else { "no" }
+        Write-Error ("Cannot run SYSTEM IRK reader. IsAdministrator={0}. Start this command/web UI from an elevated Administrator terminal, and stop any old non-admin web server first. Reason: {1}" -f $adminText, $_.Exception.Message)
+        exit 1
+    }
+    finally {
+        try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+        try { Remove-Item -Path $outputPath -Force -ErrorAction SilentlyContinue } catch {}
+        try { Remove-Item -Path $errorPath -Force -ErrorAction SilentlyContinue } catch {}
     }
 }
 
@@ -999,6 +1429,8 @@ function Invoke-MonitorCommand {
     $credentialProviderEnabled = [bool](Get-ConfigValue -Config $config -Name "credentialProviderEnabled" -Default $false)
     $unlockWindowSeconds = Get-IntOption -Options $Options -Names @("unlockwindow", "unlock-window") -Default ([int](Get-ConfigValue -Config $config -Name "unlockWindowSeconds" -Default 30))
     $statePath = Get-StringOption -Options $Options -Names @("state", "statepath", "state-path") -Default ([string](Get-ConfigValue -Config $config -Name "statePath" -Default $DefaultStatePath))
+    $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $statePath
+    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
     $once = Get-BoolOption -Options $Options -Names @("once") -Default $false
     $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $null
 
@@ -1015,14 +1447,20 @@ function Invoke-MonitorCommand {
     $lastAddress = ""
     $hasBeenNear = $false
 
-    Write-LogLine -Level "info" -Message ("monitor started; near >= {0} dBm, present >= {1} dBm, away after {2}s, lockOnAway={3}, credentialProvider={4}" -f $nearRssi, $awayRssi, $awaySeconds, $lockOnAway, $credentialProviderEnabled) -LogFile $logFile
+    $scanType = if ($active) { "active" } else { "passive" }
+    Write-LogLine -Level "info" -Message ("monitor started; near >= {0} dBm, present >= {1} dBm, away after {2}s, lockOnAway={3}, credentialProvider={4}, scanMode={5}" -f $nearRssi, $awayRssi, $awaySeconds, $lockOnAway, $credentialProviderEnabled, $scanType) -LogFile $logFile
 
     try {
         if ($credentialProviderEnabled) {
-            Clear-ProviderUnlockState -StatePath $statePath
+            try {
+                Clear-ProviderUnlockState -StatePath $statePath
+            }
+            catch {
+                Write-LogLine -Level "warn" -Message ("could not clear provider state: {0}" -f $_.Exception.Message) -LogFile $logFile
+            }
         }
 
-        $watcherInfo = Start-BleWatcher -SourceIdentifier $sourceId
+        $watcherInfo = Start-BleWatcher -SourceIdentifier $sourceId -Active $active
         while ($true) {
             $events = Receive-BleEvents -WatcherInfo $watcherInfo -TimeoutSeconds 1
             $now = Get-Date
@@ -1050,14 +1488,26 @@ function Invoke-MonitorCommand {
                     else {
                         $nearHits = 0
                     }
+                    $presence = if ($info.rssi -ge $nearRssi) { "near" } elseif ($info.rssi -ge $awayRssi) { "present" } else { "weak" }
+                    try {
+                        Set-MonitorSignalState -StatePath $signalStatePath -Address $info.address -Rssi $info.rssi -BestRssi $bestRssi -Presence $presence -NearHits $nearHits
+                    }
+                    catch {
+                        Write-LogLine -Level "warn" -Message ("could not write monitor signal state: {0}" -f $_.Exception.Message) -LogFile $logFile
+                    }
 
                     if ($state -ne "near" -and $nearHits -ge $nearHitsRequired) {
                         $state = "near"
                         $hasBeenNear = $true
                         Write-LogLine -Level "info" -Message ("near: {0}, rssi={1} dBm, best={2} dBm" -f $info.address, $info.rssi, $bestRssi) -LogFile $logFile
                         if ($credentialProviderEnabled) {
-                            Set-ProviderUnlockState -StatePath $statePath -UnlockWindowSeconds $unlockWindowSeconds -Address $info.address -Rssi $info.rssi
-                            Write-LogLine -Level "info" -Message ("credential provider unlock window opened for {0}s" -f $unlockWindowSeconds) -LogFile $logFile
+                            try {
+                                Set-ProviderUnlockState -StatePath $statePath -UnlockWindowSeconds $unlockWindowSeconds -Address $info.address -Rssi $info.rssi
+                                Write-LogLine -Level "info" -Message ("credential provider unlock window opened for {0}s" -f $unlockWindowSeconds) -LogFile $logFile
+                            }
+                            catch {
+                                Write-LogLine -Level "warn" -Message ("could not write provider unlock state: {0}" -f $_.Exception.Message) -LogFile $logFile
+                            }
                         }
                         Invoke-UserCommand -CommandLine $onNear
                         if ($once) {
@@ -1078,7 +1528,12 @@ function Invoke-MonitorCommand {
                     $bestRssi = $null
                     Write-LogLine -Level "info" -Message ("away: last={0}, missing_or_weak_for={1:N0}s" -f $lastAddress, $elapsed) -LogFile $logFile
                     if ($credentialProviderEnabled) {
-                        Clear-ProviderUnlockState -StatePath $statePath
+                        try {
+                            Clear-ProviderUnlockState -StatePath $statePath
+                        }
+                        catch {
+                            Write-LogLine -Level "warn" -Message ("could not clear provider state: {0}" -f $_.Exception.Message) -LogFile $logFile
+                        }
                     }
                     Invoke-UserCommand -CommandLine $onAway
                     if ($lockOnAway) {
@@ -1131,7 +1586,10 @@ try {
         "-h" { Show-Help }
         "--help" { Show-Help }
         "scan" { Invoke-ScanCommand -Options $Options }
+        "scan-test" { Invoke-ScanTestCommand -Options $Options }
+        "paired" { Invoke-PairedCommand -Options $Options }
         "keys" { Invoke-KeysCommand -Options $Options }
+        "keys-system" { Invoke-KeysSystemCommand -Options $Options }
         "resolve" { Invoke-ResolveCommand -Options $Options }
         "init" { Invoke-InitCommand -Options $Options }
         "remove-device" { Invoke-RemoveDeviceCommand -Options $Options }

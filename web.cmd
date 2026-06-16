@@ -14,7 +14,12 @@ for /f "tokens=5" %%P in ('netstat -ano ^| findstr /R /C:":%PORT% .*LISTENING"')
 if defined LISTEN_PID (
   echo WatchUnlock Web is already running on http://127.0.0.1:%PORT%
   echo PID: %LISTEN_PID%
-  exit /b 0
+  echo Stopping the existing server before starting this copy...
+  taskkill /PID %LISTEN_PID% /T /F >nul 2>nul
+  if errorlevel 1 (
+    echo Failed to stop PID %LISTEN_PID%. Run web-stop.cmd from an elevated terminal, then start web.cmd again.
+    exit /b 1
+  )
 )
 
 node "%ROOT%web\server.js" %PORT%

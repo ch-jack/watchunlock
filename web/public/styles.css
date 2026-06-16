@@ -173,6 +173,7 @@ h1 {
   display: grid;
   align-content: start;
   gap: 16px;
+  min-width: 0;
 }
 
 .panel {
@@ -181,6 +182,8 @@ h1 {
   border-radius: 8px;
   box-shadow: var(--shadow);
   padding: 14px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .panel-head {
@@ -189,6 +192,22 @@ h1 {
   justify-content: space-between;
   gap: 10px;
   margin-bottom: 12px;
+}
+
+.notice {
+  margin: 0 0 12px;
+  border: 1px solid #f2d3a1;
+  border-radius: 6px;
+  background: #fff8eb;
+  color: #6f4a05;
+  padding: 9px 10px;
+  font-size: 13px;
+}
+
+.selected-device {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 h2 {
@@ -269,6 +288,45 @@ label span {
   align-self: end;
 }
 
+.signal-card {
+  margin-top: 10px;
+  max-width: 100%;
+  clear: both;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfe;
+  padding: 10px;
+  overflow: hidden;
+}
+
+.signal-card.near {
+  border-color: #b9dfc6;
+  background: #f0fbf3;
+}
+
+.signal-card.present,
+.signal-card.weak,
+.signal-card.waiting {
+  border-color: #f2d3a1;
+  background: #fff8eb;
+}
+
+.signal-main {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.1;
+  overflow-wrap: anywhere;
+}
+
+.signal-meta,
+.signal-sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .split {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -289,6 +347,11 @@ label span {
   border-radius: 6px;
   padding: 9px;
   background: #fbfcfe;
+}
+
+.item.selected {
+  border-color: #b9dfc6;
+  background: #f0fbf3;
 }
 
 .item-main {
@@ -316,6 +379,8 @@ label span {
 }
 
 .log {
+  width: 100%;
+  min-width: 0;
   min-height: 180px;
   max-height: 320px;
   overflow: auto;

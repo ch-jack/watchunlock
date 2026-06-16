@@ -102,6 +102,12 @@ watchunlock.cmd monitor
 watchunlock.cmd scan -Seconds 20
 ```
 
+列出 Windows 已配对/已连接过的蓝牙设备：
+
+```cmd
+watchunlock.cmd paired
+```
+
 尝试从 Windows 蓝牙注册表列出已配对设备 IRK：
 
 ```cmd
@@ -135,6 +141,8 @@ watchunlock.cmd uninstall-provider
 - `UnlockWindow`: 靠近后允许 Credential Provider 自动提交的秒数，默认 30。
 
 ## 注意
+
+`scan` 只监听附近设备正在发送的 BLE 广播包。已经连接、已配对、休眠中，或者当前不广播的设备可能不会出现在扫描结果里；这时先用 `paired` 查看 Windows 已知设备，再用 `keys` 读取 IRK，最后用 `resolve` 测试 IRK 是否能匹配实时广播。
 
 Apple 设备会使用 BLE 隐私地址并定期轮换，所以 iPhone / Apple Watch 需要 IRK 才能稳定识别。`keys` 读取 IRK 的注册表位置通常需要管理员或 SYSTEM 权限：
 

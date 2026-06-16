@@ -38,6 +38,10 @@
             <button id="startMonitorBtn">启动</button>
             <button class="secondary" id="stopMonitorBtn">停止</button>
           </div>
+          <div class="signal-card" id="signalCard">
+            <div class="signal-main">-- dBm</div>
+            <div class="signal-meta">等待 Monitor 命中设备</div>
+          </div>
           <pre class="log" id="monitorLog"></pre>
         </section>
       </aside>
@@ -48,9 +52,13 @@
             <h2>蓝牙设备</h2>
             <div class="button-row compact">
               <button class="secondary" id="loadKeysBtn">读取 IRK</button>
+              <button class="secondary" id="pairedBtn">已配对</button>
               <button class="secondary" id="scanBtn">扫描</button>
             </div>
           </div>
+
+          <p class="notice">已连接/已配对设备不一定会出现在“扫描”里；“扫描”只看正在发 BLE 广播的设备。先点“已配对”确认 Windows 看到设备，再用“读取 IRK”和“测试匹配”做解锁识别。</p>
+          <p class="selected-device" id="selectedDevice">尚未选择配对设备</p>
 
           <form id="deviceForm" class="grid-form">
             <label>
@@ -98,7 +106,7 @@
               <div class="list" id="keyList"></div>
             </div>
             <div>
-              <h3>扫描/测试结果</h3>
+              <h3>已配对/广播/测试结果</h3>
               <div class="list" id="resultList"></div>
             </div>
           </div>
