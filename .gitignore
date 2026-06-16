@@ -1,0 +1,7 @@
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+credential-provider/bin/
+credential-provider/*.obj
+web/.runtime/

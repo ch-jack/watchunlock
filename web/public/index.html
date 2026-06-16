@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="JACK <2518926462@qq.com>">
+  <meta name="watchunlock-token" content="__WATCHUNLOCK_TOKEN__">
+  <title>WatchUnlock 配置</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div>
+        <h1>WatchUnlock</h1>
+        <p>本机蓝牙解锁配置</p>
+      </div>
+      <div class="status-strip" id="statusStrip">
+        <span class="chip neutral">加载中</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="side">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>运行状态</h2>
+            <button class="icon-btn" id="refreshStatusBtn" title="刷新状态" aria-label="刷新状态">↻</button>
+          </div>
+          <dl class="facts" id="facts"></dl>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Monitor</h2>
+          </div>
+          <div class="button-row">
+            <button id="startMonitorBtn">启动</button>
+            <button class="secondary" id="stopMonitorBtn">停止</button>
+          </div>
+          <pre class="log" id="monitorLog"></pre>
+        </section>
+      </aside>
+
+      <section class="content">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>蓝牙设备</h2>
+            <div class="button-row compact">
+              <button class="secondary" id="loadKeysBtn">读取 IRK</button>
+              <button class="secondary" id="scanBtn">扫描</button>
+            </div>
+          </div>
+
+          <form id="deviceForm" class="grid-form">
+            <label>
+              <span>设备名称</span>
+              <input name="deviceName" autocomplete="off" placeholder="Apple Watch / iPhone">
+            </label>
+            <label class="wide">
+              <span>IRK</span>
+              <input name="irk" autocomplete="off" spellcheck="false" placeholder="32 位十六进制">
+            </label>
+            <label>
+              <span>靠近阈值</span>
+              <input name="nearRssi" type="number" value="-68" min="-127" max="0">
+            </label>
+            <label>
+              <span>远离阈值</span>
+              <input name="awayRssi" type="number" value="-86" min="-127" max="0">
+            </label>
+            <label>
+              <span>远离秒数</span>
+              <input name="awaySeconds" type="number" value="30" min="5" max="600">
+            </label>
+            <label>
+              <span>靠近命中</span>
+              <input name="nearHits" type="number" value="2" min="1" max="20">
+            </label>
+            <label>
+              <span>解锁窗口</span>
+              <input name="unlockWindowSeconds" type="number" value="30" min="5" max="300">
+            </label>
+            <label class="toggle">
+              <input name="lockOnAway" type="checkbox" checked>
+              <span>远离自动锁屏</span>
+            </label>
+            <div class="form-actions wide">
+              <button type="submit">保存蓝牙</button>
+              <button type="button" class="secondary" id="testDeviceBtn">测试匹配</button>
+              <button type="button" class="danger" id="deleteDeviceBtn">删除蓝牙</button>
+            </div>
+          </form>
+
+          <div class="split">
+            <div>
+              <h3>已配对 IRK</h3>
+              <div class="list" id="keyList"></div>
+            </div>
+            <div>
+              <h3>扫描/测试结果</h3>
+              <div class="list" id="resultList"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Windows 凭据</h2>
+          </div>
+          <form id="credentialForm" class="grid-form">
+            <label>
+              <span>账号</span>
+              <input name="username" autocomplete="username" placeholder=".\用户名 或 MicrosoftAccount\邮箱">
+            </label>
+            <label>
+              <span>密码</span>
+              <input name="password" type="password" autocomplete="current-password" placeholder="Windows 密码，不是 PIN">
+            </label>
+            <label>
+              <span>解锁窗口</span>
+              <input name="unlockWindowSeconds" type="number" value="30" min="5" max="300">
+            </label>
+            <div class="form-actions">
+              <button type="submit">保存凭据</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Credential Provider</h2>
+          </div>
+          <div class="button-row">
+            <button id="installProviderBtn">注册 Provider</button>
+            <button class="secondary" id="uninstallProviderBtn">卸载 Provider</button>
+          </div>
+          <p class="path" id="providerPath"></p>
+        </section>
+      </section>
+    </main>
+
+    <footer class="footer">
+      Copyright (c) 2026 JACK &lt;2518926462@qq.com&gt;
+    </footer>
+
+    <div class="toast" id="toast" hidden></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
