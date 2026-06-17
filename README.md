@@ -158,3 +158,28 @@ native-monitor\bin\x64\watchunlock-native.exe scan-test --seconds 8
 ```
 
 After the native monitor is built, both `web.cmd` and `watchunlock.cmd monitor` automatically prefer `native-monitor\bin\x64\watchunlock-native.exe`. The PowerShell monitor remains as a fallback when the native executable is not present.
+
+## CI, Package, Release
+
+GitHub Actions runs on every push to `master` and every pull request:
+
+- build `native-monitor\bin\x64\watchunlock-native.exe`
+- build `credential-provider\bin\x64\WatchUnlockCredentialProvider.dll`
+- run native and PowerShell core self-tests
+- check Web JavaScript syntax
+- create a zip package under `dist\`
+
+Create a local package:
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
+```
+
+Publish a GitHub Release by pushing a version tag:
+
+```cmd
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release zip includes the native monitor exe, Credential Provider DLL, Web UI, cmd launchers, and install/uninstall scripts.

@@ -81,6 +81,7 @@ Examples:
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName monitor -OnNear "powershell -NoProfile -Command Write-Host near"
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName install-provider
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName selftest
+  powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName selftest -NoBluetooth
 
 Notes:
   Copyright (c) 2026 JACK <2518926462@qq.com>
@@ -1612,6 +1613,9 @@ function Invoke-MonitorCommand {
 }
 
 function Invoke-SelfTestCommand {
+    param([hashtable]$Options)
+
+    $noBluetooth = Get-BoolOption -Options $Options -Names @("nobluetooth", "no-bluetooth") -Default $false
     $irk = Convert-HexToBytes -Hex "00112233445566778899AABBCCDDEEFF"
     $prand = [byte[]](0x40, 0x11, 0x22)
     $block = Join-Bytes -Left (New-Object byte[] 13) -Right $prand
@@ -1633,14 +1637,19 @@ function Invoke-SelfTestCommand {
         }
     }
 
-    Ensure-BluetoothRuntime
-    $watcher = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher]::new()
-    if ($watcher.Status.ToString() -ne "Created") {
-        throw "BLE watcher self-test failed."
-    }
-
     Write-Host "PASS: RPA resolver"
-    Write-Host "PASS: BLE watcher creation"
+    if (-not $noBluetooth) {
+        Ensure-BluetoothRuntime
+        $watcher = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher]::new()
+        if ($watcher.Status.ToString() -ne "Created") {
+            throw "BLE watcher self-test failed."
+        }
+
+        Write-Host "PASS: BLE watcher creation"
+    }
+    else {
+        Write-Host "SKIP: BLE watcher creation"
+    }
 }
 
 $Command = Get-CommandName @args
@@ -1664,7 +1673,7 @@ try {
         "install-provider" { Invoke-InstallProviderCommand -Options $Options }
         "uninstall-provider" { Invoke-UninstallProviderCommand -Options $Options }
         "lock" { Invoke-LockWorkstation }
-        "selftest" { Invoke-SelfTestCommand }
+        "selftest" { Invoke-SelfTestCommand -Options $Options }
         default {
             throw "Unknown command: $Command. Run '.\$ScriptName help'."
         }

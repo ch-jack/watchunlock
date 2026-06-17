@@ -7,3 +7,4 @@ credential-provider/*.obj
 native-monitor/bin/
 native-monitor/*.obj
 web/.runtime/
+dist/
