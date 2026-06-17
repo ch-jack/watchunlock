@@ -268,7 +268,7 @@ async function scanDevices() {
     });
     state.discoveredDevices = Array.isArray(data.devices) ? data.devices : [];
     renderDevicePicker(state.discoveredDevices);
-    $("#deviceDialogHint").textContent = `发现 ${state.discoveredDevices.length} 个条目 · 扫描引擎 ${data.engine || "unknown"}`;
+    $("#deviceDialogHint").textContent = `发现 ${state.discoveredDevices.length} 条目 · 扫描引擎 ${data.engine || "unknown"}`;
     toast(state.discoveredDevices.length ? "扫描完成" : "没有发现蓝牙设备", state.discoveredDevices.length ? "ok" : "bad");
   } catch (error) {
     $("#deviceDialogHint").textContent = "扫描失败";
@@ -335,6 +335,19 @@ async function saveCredential(event) {
     form.password.value = "";
     toast(data.output || "凭据已保存");
     await loadStatus();
+  } catch (error) {
+    toast(error.message, "bad");
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function testUnlock(button) {
+  if (!confirm("测试会立即锁屏，并在 3 秒后尝试自动解锁。现在开始？")) return;
+  setBusy(button, true);
+  try {
+    await api("/api/credential/test", { method: "POST", body: { delaySeconds: 3 } });
+    toast("测试解锁已触发");
   } catch (error) {
     toast(error.message, "bad");
   } finally {
@@ -425,6 +438,7 @@ function wireEvents() {
   });
   $("#deviceForm").addEventListener("submit", saveDevice);
   $("#credentialForm").addEventListener("submit", saveCredential);
+  $("#testUnlockBtn").addEventListener("click", (event) => testUnlock(event.currentTarget));
   $("#installProviderBtn").addEventListener("click", (event) => providerAction("/api/provider/install", event.currentTarget));
   $("#uninstallProviderBtn").addEventListener("click", (event) => providerAction("/api/provider/uninstall", event.currentTarget));
   $("#startMonitorBtn").addEventListener("click", startMonitor);

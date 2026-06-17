@@ -6,7 +6,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(__dirname, "public");
@@ -15,7 +15,7 @@ const psScript = path.join(rootDir, "watchunlock.ps1");
 const nativeMonitorExe = path.join(rootDir, "native-monitor", "bin", "x64", "watchunlock-native.exe");
 const providerDll = path.join(rootDir, "credential-provider", "bin", "x64", "WatchUnlockCredentialProvider.dll");
 const dataRoot = path.join(process.env.ProgramData || path.join(process.env.APPDATA || rootDir, "WatchUnlockCli"), "WatchUnlockCli");
-const monitorRuntimeRoot = path.join(process.env.LOCALAPPDATA || dataRoot, "WatchUnlockCli");
+const monitorRuntimeRoot = runtimeDir;
 const configPath = path.join(dataRoot, "config.json");
 const statePath = path.join(dataRoot, "state.json");
 const monitorPidPath = path.join(monitorRuntimeRoot, "monitor.pid");
@@ -151,6 +151,34 @@ function sanitizedConfig() {
   return copy;
 }
 
+function looksLikePlaceholderName(value) {
+  const text = String(value || "").trim();
+  if (!text) return true;
+  if (/^[@?]+$/.test(text)) return true;
+  if (/^[A-Za-z0-9+/]{16,}={0,2}$/.test(text)) return true;
+  if (/^[0-9A-F]{12}$/i.test(text)) return true;
+  return false;
+}
+
+function cleanDeviceName(value, fallback = "") {
+  const text = String(value || "").trim();
+  return looksLikePlaceholderName(text) ? fallback : text;
+}
+
+function friendlyDeviceName(device, fallback = "") {
+  const address = normalizeAddress(device?.address);
+  const label = address ? `蓝牙设备 ${address}` : fallback;
+  return cleanDeviceName(device?.name, label);
+}
+
+function deviceTypeFromManufacturer(manufacturer) {
+  const items = Array.isArray(manufacturer) ? manufacturer : [];
+  if (items.some((item) => String(item || "").toUpperCase().startsWith("004C:"))) {
+    return "附近 Apple 设备";
+  }
+  return "";
+}
+
 function readPid() {
   try {
     const pid = Number(fs.readFileSync(monitorPidPath, "utf8").trim());
@@ -168,6 +196,30 @@ function isPidRunning(pid) {
   } catch {
     return false;
   }
+}
+
+function findNativeMonitorPid() {
+  try {
+    const result = spawnSync("tasklist.exe", [
+      "/FI",
+      "IMAGENAME eq watchunlock-native.exe",
+      "/FO",
+      "CSV",
+      "/NH",
+    ], {
+      cwd: rootDir,
+      windowsHide: true,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    if (result.status !== 0 || !result.stdout) return null;
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const match = line.match(/^"watchunlock-native\.exe","(\d+)"/i);
+      if (match) return Number(match[1]);
+    }
+  } catch {
+  }
+  return null;
 }
 
 async function providerStatus() {
@@ -205,13 +257,16 @@ async function startupStatus() {
 }
 
 function monitorStatus() {
-  const pid = readPid();
+  let pid = readPid();
   const childRunning = monitorChild && monitorChild.pid && !monitorChild.killed;
-  const effectivePid = pid || (childRunning ? monitorChild.pid : null);
-  const running = childRunning || isPidRunning(pid);
-  if (pid && !running) {
+  let pidRunning = isPidRunning(pid);
+  if (pid && !pidRunning) {
     try { fs.unlinkSync(monitorPidPath); } catch {}
+    pid = null;
   }
+  const fallbackPid = pid || childRunning ? null : findNativeMonitorPid();
+  const effectivePid = pid || (childRunning ? monitorChild.pid : null) || fallbackPid;
+  const running = childRunning || pidRunning || isPidRunning(fallbackPid);
   const state = readJsonFile(monitorSignalPath) || readJsonFile(statePath) || {};
   const ageSeconds = state.lastSeenAt ? Math.max(0, Math.round(Date.now() / 1000 - Number(state.lastSeenAt))) : null;
   return {
@@ -249,7 +304,16 @@ function appendMonitorLogLine(text) {
 }
 
 async function startMonitor() {
-  const result = await runWatchUnlock(["start-monitor", "-Json"], { timeoutMs: 30000 });
+  const result = await runWatchUnlock([
+    "start-monitor",
+    "-PidFile",
+    monitorPidPath,
+    "-LogFile",
+    monitorLogPath,
+    "-SignalStatePath",
+    monitorSignalPath,
+    "-Json",
+  ], { timeoutMs: 30000 });
   const data = parseJsonOutput(result, null);
   if (result.code !== 0) {
     throw new Error(`${result.stdout}${result.stderr}`.trim() || "Could not start Monitor.");
@@ -258,7 +322,16 @@ async function startMonitor() {
 }
 
 async function stopMonitor() {
-  const result = await runWatchUnlock(["stop-monitor", "-Json"], { timeoutMs: 30000 });
+  const result = await runWatchUnlock([
+    "stop-monitor",
+    "-PidFile",
+    monitorPidPath,
+    "-LogFile",
+    monitorLogPath,
+    "-SignalStatePath",
+    monitorSignalPath,
+    "-Json",
+  ], { timeoutMs: 30000 });
   const data = parseJsonOutput(result, null);
   if (result.code !== 0) {
     throw new Error(`${result.stdout}${result.stderr}`.trim() || "Could not stop Monitor.");
@@ -466,7 +539,7 @@ function findIrkForAddress(address, keys, pairedByAddress) {
         irk: normalizeIrk(key.irk),
         irkReversed: normalizeIrk(key.irkReversed),
         sourceAddress: key.device || "",
-        sourceName: pairedDevice?.name || key.device || "",
+        sourceName: pairedDevice ? friendlyDeviceName(pairedDevice, key.device || "") : key.device || "",
         pairedDevice,
         match: { type: "identity-address" },
       };
@@ -484,7 +557,7 @@ function findIrkForAddress(address, keys, pairedByAddress) {
           irk,
           irkReversed: candidate.variant === "normal" ? normalizeIrk(key.irkReversed) : normalizeIrk(key.irk),
           sourceAddress: key.device || "",
-          sourceName: pairedDevice?.name || key.device || "",
+          sourceName: pairedDevice ? friendlyDeviceName(pairedDevice, key.device || "") : key.device || "",
           pairedDevice,
           match: { type: "rpa", variant: candidate.variant, ...match },
         };
@@ -496,6 +569,18 @@ function findIrkForAddress(address, keys, pairedByAddress) {
 }
 
 function buildDiscoveredDevices(scanData, pairedData, keyData) {
+  const config = readJsonFile(configPath) || {};
+  const configuredAddress = normalizeAddress(config.deviceAddress);
+  const configuredIrk = normalizeIrk(config.irk);
+  const configuredName = cleanDeviceName(config.deviceName, "");
+  const configuredNameForKey = (matchedKey) => {
+    if (!configuredName || !matchedKey) return "";
+    return normalizeIrk(matchedKey.irk) === configuredIrk || normalizeIrk(matchedKey.irkReversed) === configuredIrk ? configuredName : "";
+  };
+  const configuredNameForIrk = (key) => {
+    if (!configuredName || !configuredIrk) return "";
+    return normalizeIrk(key?.irk) === configuredIrk || normalizeIrk(key?.irkReversed) === configuredIrk ? configuredName : "";
+  };
   const pairedByAddress = new Map();
   for (const device of pairedData.devices || []) {
     const address = normalizeAddress(device.address);
@@ -516,9 +601,11 @@ function buildDiscoveredDevices(scanData, pairedData, keyData) {
     const cleanAddress = normalizeAddress(address);
     const pairedDevice = pairedByAddress.get(cleanAddress) || null;
     const matchedKey = findIrkForAddress(address, keyData.keys || [], pairedByAddress);
+    const fallbackName = (cleanAddress && cleanAddress === configuredAddress ? configuredName : "") || configuredNameForKey(matchedKey);
+    const typeName = deviceTypeFromManufacturer(item.manufacturer);
     addRow({
       source: "scan",
-      name: item.name || matchedKey?.sourceName || pairedDevice?.name || "",
+      name: cleanDeviceName(item.name, fallbackName || matchedKey?.sourceName || (pairedDevice ? friendlyDeviceName(pairedDevice) : "") || typeName),
       address,
       rssi: Number.isFinite(Number(item.rssi)) ? Number(item.rssi) : null,
       manufacturer: item.manufacturer || [],
@@ -535,9 +622,11 @@ function buildDiscoveredDevices(scanData, pairedData, keyData) {
 
   for (const device of pairedData.devices || []) {
     const matchedKey = findIrkForAddress(device.address, keyData.keys || [], pairedByAddress);
+    const cleanAddress = normalizeAddress(device.address);
+    const fallbackName = (cleanAddress && cleanAddress === configuredAddress ? configuredName : "") || configuredNameForKey(matchedKey);
     addRow({
       source: "paired",
-      name: device.name || "",
+      name: friendlyDeviceName(device, fallbackName),
       address: device.address || "",
       rssi: null,
       manufacturer: [],
@@ -557,9 +646,10 @@ function buildDiscoveredDevices(scanData, pairedData, keyData) {
     const address = key.device || "";
     const cleanAddress = normalizeAddress(address);
     const pairedDevice = pairedByAddress.get(cleanAddress) || null;
+    const fallbackName = (cleanAddress && cleanAddress === configuredAddress ? configuredName : "") || configuredNameForIrk(key);
     addRow({
       source: "irk",
-      name: pairedDevice?.name || address || "Paired BLE key",
+      name: fallbackName || (pairedDevice ? friendlyDeviceName(pairedDevice, address || "Paired BLE key") : (address || "Paired BLE key")),
       address,
       rssi: null,
       manufacturer: [],
@@ -746,6 +836,16 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/credential/test") {
+    const delaySeconds = safeInt(body.delaySeconds, 3, 0, 30);
+    const result = await runWatchUnlock(["test-unlock", "-DelaySeconds", String(delaySeconds), "-SkipValidation"], { timeoutMs: (delaySeconds + 20) * 1000 });
+    sendJson(res, result.code === 0 ? 200 : 500, {
+      ok: result.code === 0,
+      output: `${result.stdout}${result.stderr}`.trim(),
+    });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/provider/install") {
     const result = await runWatchUnlock(["install-provider"], { timeoutMs: 60000 });
     sendJson(res, result.code === 0 ? 200 : 500, { ok: result.code === 0, output: `${result.stdout}${result.stderr}`.trim(), provider: await providerStatus() });
@@ -851,5 +951,17 @@ server.on("error", (error) => {
 
 server.listen(port, host, () => {
   console.log(`WatchUnlock Web is running at http://${host}:${port}`);
+  startMonitor()
+    .then((monitor) => {
+      if (monitor?.running) {
+        console.log(`WatchUnlock Monitor is running in background. PID: ${monitor.pid || "unknown"}`);
+        console.log(`Monitor log: ${monitor.logPath || monitorLogPath}`);
+      } else {
+        console.log("WatchUnlock Monitor did not report running. Open the Web UI for details.");
+      }
+    })
+    .catch((error) => {
+      console.error(`WatchUnlock Monitor auto-start failed: ${error.message || error}`);
+    });
   console.log("Press Ctrl+C to stop the web server.");
 });

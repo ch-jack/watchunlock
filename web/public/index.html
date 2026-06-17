@@ -40,7 +40,7 @@
           </div>
           <label class="toggle startup-toggle">
             <input id="startupToggle" type="checkbox">
-            <span>开机自启动 Monitor</span>
+            <span>开机自动启动 Monitor</span>
           </label>
           <p class="path" id="startupStatus">未启用开机自启动</p>
           <div class="signal-card" id="signalCard">
@@ -124,8 +124,10 @@
             </label>
             <div class="form-actions">
               <button type="submit">保存凭据</button>
+              <button type="button" class="secondary" id="testUnlockBtn">测试解锁</button>
             </div>
           </form>
+          <p class="notice">测试解锁会立即锁屏，3 秒后打开一次 Credential Provider 解锁窗口，用来验证账号密码是否能自动解锁。</p>
         </section>
 
         <section class="panel">

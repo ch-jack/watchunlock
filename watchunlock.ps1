@@ -1713,6 +1713,25 @@ function Get-NativeMonitorExePath {
     return Join-Path $scriptDir "native-monitor\bin\x64\watchunlock-native.exe"
 }
 
+function Find-NativeMonitorProcessId {
+    $nativeExe = Get-NativeMonitorExePath
+    try {
+        $nativeExeFull = [IO.Path]::GetFullPath($nativeExe)
+        foreach ($process in @(Get-Process -Name "watchunlock-native" -ErrorAction SilentlyContinue)) {
+            try {
+                if ([string]::Equals([IO.Path]::GetFullPath([string]$process.Path), $nativeExeFull, [StringComparison]::OrdinalIgnoreCase)) {
+                    return [int]$process.Id
+                }
+            }
+            catch {
+            }
+        }
+    }
+    catch {
+    }
+    return $null
+}
+
 function Get-MonitorStatusObject {
     param(
         [string]$PidFile = $DefaultMonitorPidPath,
@@ -1727,6 +1746,12 @@ function Get-MonitorStatusObject {
         if (-not $running) {
             Remove-Item -Path $PidFile -Force -ErrorAction SilentlyContinue
             $pidValue = $null
+        }
+    }
+    if (-not $running) {
+        $pidValue = Find-NativeMonitorProcessId
+        if ($null -ne $pidValue) {
+            $running = Test-ProcessRunning -ProcessId $pidValue
         }
     }
 
@@ -1751,6 +1776,31 @@ function Write-CommandResult {
     }
 }
 
+function Write-MonitorCommandResult {
+    param($Object, [bool]$Json)
+
+    if ($Json) {
+        Write-CommandResult -Object $Object -Json $true
+        return
+    }
+
+    if ($Object.running) {
+        Write-Host ("Monitor is running in background. PID: {0}" -f $Object.pid)
+        Write-Host ("PID file: {0}" -f $Object.pidPath)
+        Write-Host ("Log file: {0}" -f $Object.logPath)
+        Write-Host ("Signal file: {0}" -f $Object.signalPath)
+        if ($Object.PSObject.Properties["warning"] -and -not [string]::IsNullOrWhiteSpace([string]$Object.warning)) {
+            Write-Host ("Warning: {0}" -f $Object.warning)
+        }
+        Write-Host "Use 'watchunlock.cmd monitor-status' to check it later, or open the Web UI."
+    }
+    else {
+        Write-Host "Monitor is not running."
+        Write-Host ("PID file: {0}" -f $Object.pidPath)
+        Write-Host ("Log file: {0}" -f $Object.logPath)
+    }
+}
+
 function Invoke-MonitorStatusCommand {
     param([hashtable]$Options)
 
@@ -1758,7 +1808,7 @@ function Invoke-MonitorStatusCommand {
     $pidFile = Get-StringOption -Options $Options -Names @("pidfile", "pid-file") -Default $DefaultMonitorPidPath
     $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $DefaultMonitorLogPath
     $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $DefaultMonitorSignalPath
-    Write-CommandResult -Object (Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath) -Json $json
+    Write-MonitorCommandResult -Object (Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath) -Json $json
 }
 
 function Invoke-StartMonitorCommand {
@@ -1772,7 +1822,7 @@ function Invoke-StartMonitorCommand {
 
     $current = Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath
     if ($current.running) {
-        Write-CommandResult -Object $current -Json $json
+        Write-MonitorCommandResult -Object $current -Json $json
         return
     }
 
@@ -1801,11 +1851,25 @@ function Invoke-StartMonitorCommand {
     catch {
     }
     $process = Start-Process -FilePath $file -ArgumentList (Join-CommandArguments -Arguments $arguments) -WorkingDirectory $scriptDir -WindowStyle Hidden -PassThru
-    Set-Content -Path $pidFile -Value ([string]$process.Id) -Encoding UTF8
+    $pidWriteError = ""
+    try {
+        Set-Content -Path $pidFile -Value ([string]$process.Id) -Encoding UTF8 -Force
+    }
+    catch {
+        $pidWriteError = $_.Exception.Message
+    }
 
+    Start-Sleep -Milliseconds 500
     $result = Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath
+    if (-not $result.running -and (Test-ProcessRunning -ProcessId $process.Id)) {
+        $result.running = $true
+        $result.pid = $process.Id
+    }
     $result | Add-Member -NotePropertyName engine -NotePropertyValue $engine
-    Write-CommandResult -Object $result -Json $json
+    if (-not [string]::IsNullOrWhiteSpace($pidWriteError)) {
+        $result | Add-Member -NotePropertyName warning -NotePropertyValue ("Monitor started, but could not write pid file: {0}" -f $pidWriteError)
+    }
+    Write-MonitorCommandResult -Object $result -Json $json
 }
 
 function Invoke-StopMonitorCommand {
@@ -1816,11 +1880,22 @@ function Invoke-StopMonitorCommand {
     $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $DefaultMonitorLogPath
     $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $DefaultMonitorSignalPath
     $pidValue = Get-MonitorPid -PidFile $pidFile
+    if ($null -eq $pidValue) {
+        $pidValue = Find-NativeMonitorProcessId
+    }
     if ($null -ne $pidValue -and (Test-ProcessRunning -ProcessId $pidValue)) {
-        Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+        try {
+            Start-Process -FilePath "taskkill.exe" -ArgumentList @("/PID", [string]$pidValue, "/T", "/F") -WindowStyle Hidden -Wait | Out-Null
+        }
+        catch {
+            Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+        }
+        for ($i = 0; $i -lt 20 -and (Test-ProcessRunning -ProcessId $pidValue); $i++) {
+            Start-Sleep -Milliseconds 100
+        }
     }
     Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
-    Write-CommandResult -Object (Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath) -Json $json
+    Write-MonitorCommandResult -Object (Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath) -Json $json
 }
 
 function Get-StartupStatusObject {
