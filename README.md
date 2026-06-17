@@ -168,6 +168,7 @@ GitHub Actions runs on every push to `master` and every pull request:
 - run native and PowerShell core self-tests
 - check Web JavaScript syntax
 - create a zip package under `dist\`
+- update the `latest` prerelease on every successful `master` build
 
 Create a local package:
 
@@ -175,11 +176,17 @@ Create a local package:
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
 ```
 
-Publish a GitHub Release by pushing a version tag:
+Automatic development release:
+
+- push to `master`
+- wait for Actions to pass
+- download the zip from the `latest` prerelease
+
+Publish a formal GitHub Release by pushing a version tag:
 
 ```cmd
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release zip includes the native monitor exe, Credential Provider DLL, Web UI, cmd launchers, and install/uninstall scripts.
+Both release zips include the native monitor exe, Credential Provider DLL, Web UI, cmd launchers, and install/uninstall scripts.
