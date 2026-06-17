@@ -14,6 +14,18 @@ else {
 }
 $DefaultConfigPath = Join-Path $DefaultDataRoot "config.json"
 $DefaultStatePath = Join-Path $DefaultDataRoot "state.json"
+$DefaultProviderLogPath = Join-Path $DefaultDataRoot "provider.log"
+$LocalApplicationData = [Environment]::GetFolderPath("LocalApplicationData")
+$DefaultRuntimeRoot = if ([string]::IsNullOrWhiteSpace($LocalApplicationData)) {
+    $DefaultDataRoot
+}
+else {
+    Join-Path $LocalApplicationData "WatchUnlockCli"
+}
+$DefaultMonitorPidPath = Join-Path $DefaultRuntimeRoot "monitor.pid"
+$DefaultMonitorLogPath = Join-Path $DefaultRuntimeRoot "monitor.log"
+$DefaultMonitorSignalPath = Join-Path $DefaultRuntimeRoot "monitor-signal.json"
+$DefaultStartupTaskName = "WatchUnlock Monitor"
 
 function Show-Help {
     @"
@@ -36,11 +48,27 @@ Commands:
              Remove the configured trusted Bluetooth device from config.
   set-credential
              Save the Windows logon account/password for the Credential Provider.
+  test-unlock
+             Lock Windows, then after a short delay open a Credential Provider unlock window.
   monitor    Watch an IRK and trigger actions on near/away transitions.
+  start-monitor
+             Start the Monitor in the background without starting the Web UI.
+  stop-monitor
+             Stop the background Monitor started by start-monitor or startup.
+  monitor-status
+             Show whether the background Monitor is running.
+  enable-startup
+             Start the background Monitor automatically at Windows logon.
+  disable-startup
+             Disable automatic Monitor startup.
+  startup-status
+             Show automatic Monitor startup status.
   install-provider
              Register the native Credential Provider DLL.
   uninstall-provider
              Unregister the native Credential Provider DLL.
+  provider-log
+             Show the Credential Provider diagnostic log.
   lock       Lock the workstation immediately.
   selftest   Run local parser and BLE runtime self-tests.
 
@@ -63,13 +91,19 @@ Monitor options:
   -OnAway <command>      Command to run on away transition.
   -Once                  Exit after the first near/away transition.
   -LogFile <path>        Append monitor logs to a file.
+  -PidFile <path>        PID file for start-monitor/stop-monitor.
+  -SignalStatePath <path>
+                         Signal state file for Monitor status.
 
 Credential Provider options:
   -Username <name>       Windows account, for example ".\alice" or "MicrosoftAccount\name@example.com".
   -Password <password>   Password to encrypt into config. If omitted, prompts securely.
   -UnlockWindow <n>      Seconds the provider may auto-submit after a near event. Default: 30.
+  -DelaySeconds <n>      Seconds to wait after locking before test-unlock opens the unlock window. Default: 3.
   -ProviderDll <path>    Native provider DLL path for install/uninstall.
+  -Tail <n>              Lines to show for provider-log. Default: 80.
   -PasswordStdin         Read the password from stdin instead of the command line.
+  -SkipValidation        For test-unlock, skip local LogonUser credential validation.
 
 Examples:
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName scan -Seconds 20
@@ -78,6 +112,10 @@ Examples:
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName init -Irk 00112233445566778899AABBCCDDEEFF -LockOnAway
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName remove-device
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName set-credential -Username ".\alice"
+  powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName test-unlock
+  powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName provider-log
+  powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName start-monitor
+  powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName enable-startup
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName monitor -OnNear "powershell -NoProfile -Command Write-Host near"
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName install-provider
   powershell.exe -ExecutionPolicy Bypass -File .\$ScriptName selftest
@@ -765,6 +803,19 @@ function Save-ConfigMap {
     $Map | ConvertTo-Json -Depth 6 | Set-Content -Path $Path -Encoding UTF8
 }
 
+function Ensure-Directory {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or (Test-Path $Path)) {
+        return
+    }
+
+    New-Item -ItemType Directory -Path $Path -ErrorAction SilentlyContinue | Out-Null
+    if (-not (Test-Path $Path)) {
+        throw "Cannot create directory: $Path"
+    }
+}
+
 function Get-ConfigValue {
     param($Config, [string]$Name, $Default = $null)
     if ($null -eq $Config) {
@@ -809,6 +860,46 @@ function Protect-TextForMachine {
     }
 }
 
+function Unprotect-TextForMachine {
+    param([Parameter(Mandatory = $true)][string]$Text)
+
+    Add-Type -AssemblyName System.Security
+    $protected = [Convert]::FromBase64String($Text)
+    $bytes = $null
+    try {
+        $bytes = [Security.Cryptography.ProtectedData]::Unprotect(
+            $protected,
+            $null,
+            [Security.Cryptography.DataProtectionScope]::LocalMachine
+        )
+        return [Text.Encoding]::Unicode.GetString($bytes)
+    }
+    finally {
+        if ($null -ne $bytes) {
+            [Array]::Clear($bytes, 0, $bytes.Length)
+        }
+        [Array]::Clear($protected, 0, $protected.Length)
+    }
+}
+
+function Normalize-WindowsUsernameForLogon {
+    param([Parameter(Mandatory = $true)][string]$Username)
+
+    if ([string]::IsNullOrWhiteSpace($Username)) {
+        return $Username
+    }
+
+    if ($Username -match "^\.[\\/](.+)$") {
+        return ("{0}\{1}" -f $env:COMPUTERNAME, $Matches[1])
+    }
+
+    if ($Username -notmatch "[\\/]" -and $Username -notmatch "@") {
+        return ("{0}\{1}" -f $env:COMPUTERNAME, $Username)
+    }
+
+    return $Username
+}
+
 function Test-WindowsCredential {
     param(
         [Parameter(Mandatory = $true)][string]$Username,
@@ -832,9 +923,10 @@ namespace WatchUnlock {
 "@
     }
 
+    $normalizedUsername = Normalize-WindowsUsernameForLogon -Username $Username
     $domain = $null
-    $user = $Username
-    if ($Username -match "^([^\\]+)\\(.+)$") {
+    $user = $normalizedUsername
+    if ($normalizedUsername -match "^([^\\]+)\\(.+)$") {
         $domain = $Matches[1]
         $user = $Matches[2]
     }
@@ -848,7 +940,7 @@ namespace WatchUnlock {
 
     [pscustomobject]@{
         ok        = [bool]$ok
-        username  = $Username
+        username  = $normalizedUsername
         domain    = $domain
         user      = $user
         errorCode = if ($ok) { 0 } else { $errorCode }
@@ -857,8 +949,7 @@ namespace WatchUnlock {
 }
 
 function Get-UnixTimeSeconds {
-    $epoch = [DateTime]"1970-01-01T00:00:00Z"
-    return [int64](([DateTime]::UtcNow - $epoch).TotalSeconds)
+    return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 }
 
 function Set-ProviderUnlockState {
@@ -1406,6 +1497,10 @@ function Invoke-InitCommand {
     if (-not [string]::IsNullOrWhiteSpace($deviceName)) {
         $settings["deviceName"] = $deviceName
     }
+    $deviceAddress = Get-StringOption -Options $Options -Names @("deviceaddress", "device-address") -Default ([string](Get-ConfigValue -Config $existingConfig -Name "deviceAddress" -Default ""))
+    if (-not [string]::IsNullOrWhiteSpace($deviceAddress)) {
+        $settings["deviceAddress"] = $deviceAddress
+    }
 
     Save-ConfigMap -Map $settings -Path $configPath
     Write-Host "Saved config: $configPath"
@@ -1445,10 +1540,11 @@ function Invoke-SetCredentialCommand {
     $config = Get-Config -Path $configPath
     $settings = ConvertTo-ConfigMap -Config $config
 
-    $username = Get-StringOption -Options $Options -Names @("username", "user") -Default ([string](Get-ConfigValue -Config $config -Name "username" -Default ""))
-    if ([string]::IsNullOrWhiteSpace($username)) {
+    $usernameInput = Get-StringOption -Options $Options -Names @("username", "user") -Default ([string](Get-ConfigValue -Config $config -Name "username" -Default ""))
+    if ([string]::IsNullOrWhiteSpace($usernameInput)) {
         throw "Missing -Username. Examples: '.\alice', 'DOMAIN\alice', or 'MicrosoftAccount\name@example.com'."
     }
+    $username = Normalize-WindowsUsernameForLogon -Username $usernameInput
 
     $passwordStdin = Get-BoolOption -Options $Options -Names @("passwordstdin", "password-stdin") -Default $false
     $password = Get-StringOption -Options $Options -Names @("password", "pass") -Default $null
@@ -1490,6 +1586,31 @@ function Get-DefaultProviderDllPath {
     return Join-Path $scriptDir "credential-provider\bin\x64\WatchUnlockCredentialProvider.dll"
 }
 
+function Test-CredentialProviderRegistered {
+    $subKey = "SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\Credential Providers\{B2B7A4C9-6170-4B34-8B95-A4B3E7BBEA6C}"
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64
+        )
+        $key = $base.OpenSubKey($subKey)
+        return $null -ne $key
+    }
+    catch {
+        return (Test-Path ("Registry::HKEY_LOCAL_MACHINE\{0}" -f $subKey))
+    }
+    finally {
+        if ($null -ne $key) {
+            $key.Close()
+        }
+        if ($null -ne $base) {
+            $base.Close()
+        }
+    }
+}
+
 function Invoke-InstallProviderCommand {
     param([hashtable]$Options)
 
@@ -1518,6 +1639,296 @@ function Invoke-UninstallProviderCommand {
         throw "regsvr32 /u failed with exit code $($process.ExitCode)."
     }
     Write-Host "Unregistered Credential Provider: $dllPath"
+}
+
+function Invoke-ProviderLogCommand {
+    param([hashtable]$Options)
+
+    $tail = Get-IntOption -Options $Options -Names @("tail", "lines") -Default 80
+    $clear = Get-BoolOption -Options $Options -Names @("clear") -Default $false
+
+    if ($clear) {
+        Remove-Item -Path $DefaultProviderLogPath -Force -ErrorAction SilentlyContinue
+        Write-Host "Cleared provider log: $DefaultProviderLogPath"
+        return
+    }
+
+    if (-not (Test-Path $DefaultProviderLogPath)) {
+        Write-Host "Provider log not found: $DefaultProviderLogPath"
+        return
+    }
+
+    Write-Host "Provider log: $DefaultProviderLogPath"
+    Get-Content -Path $DefaultProviderLogPath -Tail $tail -Encoding UTF8
+}
+
+function Join-CommandArguments {
+    param([string[]]$Arguments)
+
+    $quoted = foreach ($argument in $Arguments) {
+        $text = [string]$argument
+        if ($text -notmatch "[\s`"]") {
+            $text
+        }
+        else {
+            '"' + ($text -replace '"', '\"') + '"'
+        }
+    }
+    return ($quoted -join " ")
+}
+
+function Test-ProcessRunning {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0) {
+        return $false
+    }
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return -not $process.HasExited
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-MonitorPid {
+    param([string]$PidFile)
+
+    try {
+        if (Test-Path $PidFile) {
+            $text = (Get-Content -Path $PidFile -Raw -Encoding UTF8).Trim()
+            if ($text -match "^\d+$") {
+                return [int]$text
+            }
+        }
+    }
+    catch {
+    }
+    return $null
+}
+
+function Get-NativeMonitorExePath {
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    return Join-Path $scriptDir "native-monitor\bin\x64\watchunlock-native.exe"
+}
+
+function Get-MonitorStatusObject {
+    param(
+        [string]$PidFile = $DefaultMonitorPidPath,
+        [string]$LogFile = $DefaultMonitorLogPath,
+        [string]$SignalStatePath = $DefaultMonitorSignalPath
+    )
+
+    $pidValue = Get-MonitorPid -PidFile $PidFile
+    $running = $false
+    if ($null -ne $pidValue) {
+        $running = Test-ProcessRunning -ProcessId $pidValue
+        if (-not $running) {
+            Remove-Item -Path $PidFile -Force -ErrorAction SilentlyContinue
+            $pidValue = $null
+        }
+    }
+
+    [pscustomobject]@{
+        running         = [bool]$running
+        pid             = $pidValue
+        pidPath         = $PidFile
+        logPath         = $LogFile
+        signalPath      = $SignalStatePath
+        nativeAvailable = (Test-Path (Get-NativeMonitorExePath))
+    }
+}
+
+function Write-CommandResult {
+    param($Object, [bool]$Json)
+
+    if ($Json) {
+        $Object | ConvertTo-Json -Depth 6
+    }
+    else {
+        $Object | Format-List
+    }
+}
+
+function Invoke-MonitorStatusCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $pidFile = Get-StringOption -Options $Options -Names @("pidfile", "pid-file") -Default $DefaultMonitorPidPath
+    $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $DefaultMonitorLogPath
+    $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $DefaultMonitorSignalPath
+    Write-CommandResult -Object (Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath) -Json $json
+}
+
+function Invoke-StartMonitorCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $configPath = Get-StringOption -Options $Options -Names @("config") -Default $DefaultConfigPath
+    $pidFile = Get-StringOption -Options $Options -Names @("pidfile", "pid-file") -Default $DefaultMonitorPidPath
+    $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $DefaultMonitorLogPath
+    $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $DefaultMonitorSignalPath
+
+    $current = Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath
+    if ($current.running) {
+        Write-CommandResult -Object $current -Json $json
+        return
+    }
+
+    foreach ($path in @($pidFile, $logFile, $signalStatePath)) {
+        $folder = Split-Path -Parent $path
+        Ensure-Directory -Path $folder
+    }
+    Remove-Item -Path $signalStatePath -Force -ErrorAction SilentlyContinue
+
+    $nativeExe = Get-NativeMonitorExePath
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    if (Test-Path $nativeExe) {
+        $file = $nativeExe
+        $arguments = @("monitor", "--config", $configPath, "--log-file", $logFile, "--signal-state", $signalStatePath)
+        $engine = "native"
+    }
+    else {
+        $file = "powershell.exe"
+        $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "monitor", "-Config", $configPath, "-LogFile", $logFile, "-SignalStatePath", $signalStatePath)
+        $engine = "powershell"
+    }
+
+    try {
+        Add-Content -Path $logFile -Value ("`n--- monitor start {0} via start-monitor ---" -f ([DateTimeOffset]::Now.ToString("o"))) -Encoding UTF8
+    }
+    catch {
+    }
+    $process = Start-Process -FilePath $file -ArgumentList (Join-CommandArguments -Arguments $arguments) -WorkingDirectory $scriptDir -WindowStyle Hidden -PassThru
+    Set-Content -Path $pidFile -Value ([string]$process.Id) -Encoding UTF8
+
+    $result = Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath
+    $result | Add-Member -NotePropertyName engine -NotePropertyValue $engine
+    Write-CommandResult -Object $result -Json $json
+}
+
+function Invoke-StopMonitorCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $pidFile = Get-StringOption -Options $Options -Names @("pidfile", "pid-file") -Default $DefaultMonitorPidPath
+    $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $DefaultMonitorLogPath
+    $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $DefaultMonitorSignalPath
+    $pidValue = Get-MonitorPid -PidFile $pidFile
+    if ($null -ne $pidValue -and (Test-ProcessRunning -ProcessId $pidValue)) {
+        Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
+    Write-CommandResult -Object (Get-MonitorStatusObject -PidFile $pidFile -LogFile $logFile -SignalStatePath $signalStatePath) -Json $json
+}
+
+function Get-StartupStatusObject {
+    $task = $null
+    try {
+        $task = Get-ScheduledTask -TaskName $DefaultStartupTaskName -ErrorAction Stop
+    }
+    catch {
+    }
+
+    [pscustomobject]@{
+        exists   = $null -ne $task
+        enabled  = ($null -ne $task -and $task.State -ne "Disabled")
+        taskName = $DefaultStartupTaskName
+        state    = if ($null -ne $task) { [string]$task.State } else { "" }
+    }
+}
+
+function Invoke-StartupStatusCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    Write-CommandResult -Object (Get-StartupStatusObject) -Json $json
+}
+
+function Invoke-EnableStartupCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    $scriptDir = Split-Path -Parent $PSCommandPath
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File " + (Join-CommandArguments -Arguments @($PSCommandPath)) + " start-monitor"
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $arguments -WorkingDirectory $scriptDir
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    Register-ScheduledTask -TaskName $DefaultStartupTaskName -Action $action -Trigger $trigger -Settings $settings -Description "Start WatchUnlock Monitor without starting the Web UI." -Force | Out-Null
+    Write-CommandResult -Object (Get-StartupStatusObject) -Json $json
+}
+
+function Invoke-DisableStartupCommand {
+    param([hashtable]$Options)
+
+    $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
+    Unregister-ScheduledTask -TaskName $DefaultStartupTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Write-CommandResult -Object (Get-StartupStatusObject) -Json $json
+}
+
+function Invoke-TestUnlockCommand {
+    param([hashtable]$Options)
+
+    $configPath = Get-StringOption -Options $Options -Names @("config") -Default $DefaultConfigPath
+    $config = Get-Config -Path $configPath
+    if ($null -eq $config) {
+        throw "Config not found: $configPath. Save Windows credentials first."
+    }
+
+    $username = [string](Get-ConfigValue -Config $config -Name "username" -Default "")
+    $protectedPassword = [string](Get-ConfigValue -Config $config -Name "passwordProtected" -Default "")
+    if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($protectedPassword)) {
+        throw "Missing saved Windows credential. Run '.\$ScriptName set-credential -Username <name>' or save it in the Web UI first."
+    }
+
+    if (-not (Test-CredentialProviderRegistered)) {
+        throw "WatchUnlock Credential Provider is not registered. Run '.\$ScriptName install-provider' first."
+    }
+
+    $delaySeconds = Get-IntOption -Options $Options -Names @("delayseconds", "delay-seconds", "delay") -Default 3
+    if ($delaySeconds -lt 0) {
+        throw "-DelaySeconds cannot be negative."
+    }
+
+    $unlockWindowSeconds = Get-IntOption -Options $Options -Names @("unlockwindow", "unlock-window") -Default ([int](Get-ConfigValue -Config $config -Name "unlockWindowSeconds" -Default 30))
+    if ($unlockWindowSeconds -lt 5) {
+        $unlockWindowSeconds = 5
+    }
+
+    $statePath = Get-StringOption -Options $Options -Names @("state", "statepath", "state-path") -Default ([string](Get-ConfigValue -Config $config -Name "statePath" -Default $DefaultStatePath))
+    $skipValidation = Get-BoolOption -Options $Options -Names @("skipvalidation", "skip-validation") -Default $false
+
+    if (-not $skipValidation) {
+        $password = Unprotect-TextForMachine -Text $protectedPassword
+        try {
+            $validation = Test-WindowsCredential -Username $username -Password $password
+        }
+        finally {
+            $password = $null
+        }
+        if (-not $validation.ok) {
+            throw ("Saved credential validation failed ({0}) {1}. Fix the Windows credential first, or rerun test-unlock with -SkipValidation if this account cannot be checked by LogonUser." -f $validation.errorCode, $validation.message)
+        }
+        Write-Host "Credential validation: OK"
+    }
+    else {
+        Write-Host "Credential validation: skipped"
+    }
+
+    Remove-Item -Path $DefaultProviderLogPath -Force -ErrorAction SilentlyContinue
+    Clear-ProviderUnlockState -StatePath $statePath
+    Write-Host ("Locking workstation now. Unlock state will be opened after {0}s for {1}s." -f $delaySeconds, $unlockWindowSeconds)
+    Write-Host "If the test fails, sign in manually and check that the WatchUnlock Credential Provider is installed and enabled."
+    Write-Host ("After signing back in, run '.\{0} provider-log' to inspect Provider diagnostics." -f $ScriptName)
+
+    Invoke-LockWorkstation
+    if ($delaySeconds -gt 0) {
+        Start-Sleep -Seconds $delaySeconds
+    }
+
+    Set-ProviderUnlockState -StatePath $statePath -UnlockWindowSeconds $unlockWindowSeconds -Address "test-unlock" -Rssi 0
+    Write-Host ("Unlock test state written: {0}" -f $statePath)
 }
 
 function Invoke-MonitorCommand {
@@ -1724,9 +2135,25 @@ try {
         "init" { Invoke-InitCommand -Options $Options }
         "remove-device" { Invoke-RemoveDeviceCommand -Options $Options }
         "set-credential" { Invoke-SetCredentialCommand -Options $Options }
+        "test-unlock" { Invoke-TestUnlockCommand -Options $Options }
+        "testunlock" { Invoke-TestUnlockCommand -Options $Options }
         "monitor" { Invoke-MonitorCommand -Options $Options }
+        "start-monitor" { Invoke-StartMonitorCommand -Options $Options }
+        "startmonitor" { Invoke-StartMonitorCommand -Options $Options }
+        "stop-monitor" { Invoke-StopMonitorCommand -Options $Options }
+        "stopmonitor" { Invoke-StopMonitorCommand -Options $Options }
+        "monitor-status" { Invoke-MonitorStatusCommand -Options $Options }
+        "monitorstatus" { Invoke-MonitorStatusCommand -Options $Options }
+        "enable-startup" { Invoke-EnableStartupCommand -Options $Options }
+        "enablestartup" { Invoke-EnableStartupCommand -Options $Options }
+        "disable-startup" { Invoke-DisableStartupCommand -Options $Options }
+        "disablestartup" { Invoke-DisableStartupCommand -Options $Options }
+        "startup-status" { Invoke-StartupStatusCommand -Options $Options }
+        "startupstatus" { Invoke-StartupStatusCommand -Options $Options }
         "install-provider" { Invoke-InstallProviderCommand -Options $Options }
         "uninstall-provider" { Invoke-UninstallProviderCommand -Options $Options }
+        "provider-log" { Invoke-ProviderLogCommand -Options $Options }
+        "providerlog" { Invoke-ProviderLogCommand -Options $Options }
         "lock" { Invoke-LockWorkstation }
         "selftest" { Invoke-SelfTestCommand -Options $Options }
         default {

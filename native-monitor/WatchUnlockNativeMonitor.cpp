@@ -877,6 +877,26 @@ static bool WriteMonitorSignalState(const std::wstring& statePath, const std::ws
     return WriteTextFile(statePath, json.str());
 }
 
+static bool WriteMonitorWaitingState(const std::wstring& statePath, const std::wstring& reason)
+{
+    const long long now = UnixNow();
+    std::wstringstream json;
+    json << L"{\n"
+         << L"  \"allowUnlockUntil\": 0,\n"
+         << L"  \"unlockToken\": \"\",\n"
+         << L"  \"lastNearAt\": 0,\n"
+         << L"  \"lastSeenAt\": " << now << L",\n"
+         << L"  \"lastSeenIso\": \"" << JsonEscape(IsoNow()) << L"\",\n"
+         << L"  \"address\": \"\",\n"
+         << L"  \"rssi\": null,\n"
+         << L"  \"bestRssi\": null,\n"
+         << L"  \"presence\": \"waiting\",\n"
+         << L"  \"reason\": \"" << JsonEscape(reason) << L"\",\n"
+         << L"  \"nearHits\": 0\n"
+         << L"}\n";
+    return WriteTextFile(statePath, json.str());
+}
+
 static void StartUserCommand(const std::wstring& command)
 {
     if (command.empty())
@@ -960,7 +980,7 @@ static void LoadSettingsFromConfig(Settings& settings)
     }
 }
 
-static bool BuildSettings(const Options& options, Settings& settings, std::wstring& error)
+static bool BuildSettings(const Options& options, Settings& settings, std::wstring& error, bool requireIrk = true)
 {
     settings.configPath = OptionString(options, { L"config" }, settings.configPath);
     LoadSettingsFromConfig(settings);
@@ -985,8 +1005,12 @@ static bool BuildSettings(const Options& options, Settings& settings, std::wstri
 
     if (!HexToBytes(settings.irkHex, 16, settings.irk))
     {
-        error = L"Missing or invalid IRK. Configure a 16-byte / 32-hex-character IRK first.";
-        return false;
+        settings.irk.clear();
+        if (requireIrk)
+        {
+            error = L"Missing or invalid IRK. Configure a 16-byte / 32-hex-character IRK first.";
+            return false;
+        }
     }
     if (settings.awayRssi >= settings.nearRssi)
     {
@@ -1006,6 +1030,16 @@ static bool BuildSettings(const Options& options, Settings& settings, std::wstri
         settings.signalStatePath = settings.statePath;
     }
     return true;
+}
+
+static void ResetRuntime(RuntimeState& runtime)
+{
+    runtime.state = L"unknown";
+    runtime.nearHits = 0;
+    runtime.lastPresentAt.reset();
+    runtime.bestRssi.reset();
+    runtime.lastAddress.clear();
+    runtime.hasBeenNear = false;
 }
 
 static std::wstring WatcherStatusText(BluetoothLEAdvertisementWatcherStatus status)
@@ -1236,7 +1270,7 @@ static int RunMonitor(const Options& options)
 {
     Settings settings;
     std::wstring error;
-    if (!BuildSettings(options, settings, error))
+    if (!BuildSettings(options, settings, error, false))
     {
         std::wcerr << error << L"\n";
         return 1;
@@ -1247,6 +1281,9 @@ static int RunMonitor(const Options& options)
 
     std::mutex mutex;
     RuntimeState runtime;
+    bool hasLoggedWaiting = false;
+    auto lastConfigReload = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    auto lastWaitingStateWrite = std::chrono::steady_clock::now() - std::chrono::seconds(10);
 
     if (settings.credentialProviderEnabled)
     {
@@ -1259,12 +1296,28 @@ static int RunMonitor(const Options& options)
         L"s, lockOnAway=" + (settings.lockOnAway ? std::wstring(L"true") : std::wstring(L"false")) +
         L", credentialProvider=" + (settings.credentialProviderEnabled ? std::wstring(L"true") : std::wstring(L"false")) +
         L", scanMode=" + (settings.active ? std::wstring(L"active") : std::wstring(L"passive")));
+    if (settings.irk.empty())
+    {
+        LogLine(settings, L"INFO", L"no IRK configured; monitor will keep running and wait for config");
+        WriteMonitorWaitingState(settings.signalStatePath, L"missing_irk");
+        hasLoggedWaiting = true;
+    }
 
     BluetoothLEAdvertisementWatcher watcher;
     watcher.ScanningMode(settings.active ? BluetoothLEScanningMode::Active : BluetoothLEScanningMode::Passive);
     const event_token token = watcher.Received([&](BluetoothLEAdvertisementWatcher const&, BluetoothLEAdvertisementReceivedEventArgs const& args) {
+        Settings current;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            current = settings;
+        }
+        if (current.irk.empty())
+        {
+            return;
+        }
+
         const std::vector<unsigned char> addressBytes = AddressToBytes(args.BluetoothAddress());
-        if (!ResolveRpaAddress(addressBytes, settings.irk))
+        if (!ResolveRpaAddress(addressBytes, current.irk))
         {
             return;
         }
@@ -1279,11 +1332,11 @@ static int RunMonitor(const Options& options)
         {
             runtime.bestRssi = rssi;
         }
-        if (rssi >= settings.awayRssi)
+        if (rssi >= current.awayRssi)
         {
             runtime.lastPresentAt = now;
         }
-        if (rssi >= settings.nearRssi)
+        if (rssi >= current.nearRssi)
         {
             ++runtime.nearHits;
         }
@@ -1292,29 +1345,29 @@ static int RunMonitor(const Options& options)
             runtime.nearHits = 0;
         }
 
-        const std::wstring presence = rssi >= settings.nearRssi ? L"near" : (rssi >= settings.awayRssi ? L"present" : L"weak");
-        WriteMonitorSignalState(settings.signalStatePath, address, rssi, runtime.bestRssi.value_or(rssi), presence, runtime.nearHits);
+        const std::wstring presence = rssi >= current.nearRssi ? L"near" : (rssi >= current.awayRssi ? L"present" : L"weak");
+        WriteMonitorSignalState(current.signalStatePath, address, rssi, runtime.bestRssi.value_or(rssi), presence, runtime.nearHits);
 
-        if (runtime.state != L"near" && runtime.nearHits >= settings.nearHitsRequired)
+        if (runtime.state != L"near" && runtime.nearHits >= current.nearHitsRequired)
         {
             runtime.state = L"near";
             runtime.hasBeenNear = true;
-            LogLine(settings, L"INFO", L"near: " + address + L", rssi=" + std::to_wstring(rssi) +
+            LogLine(current, L"INFO", L"near: " + address + L", rssi=" + std::to_wstring(rssi) +
                 L" dBm, best=" + std::to_wstring(runtime.bestRssi.value_or(rssi)) + L" dBm");
-            if (settings.credentialProviderEnabled)
+            if (current.credentialProviderEnabled)
             {
-                if (WriteProviderUnlockState(settings.statePath, settings.unlockWindowSeconds, address, rssi))
+                if (WriteProviderUnlockState(current.statePath, current.unlockWindowSeconds, address, rssi))
                 {
-                    LogLine(settings, L"INFO", L"credential provider unlock window opened for " +
-                        std::to_wstring(settings.unlockWindowSeconds) + L"s");
+                    LogLine(current, L"INFO", L"credential provider unlock window opened for " +
+                        std::to_wstring(current.unlockWindowSeconds) + L"s");
                 }
                 else
                 {
-                    LogLine(settings, L"WARN", L"could not write provider unlock state");
+                    LogLine(current, L"WARN", L"could not write provider unlock state");
                 }
             }
-            StartUserCommand(settings.onNear);
-            if (settings.once)
+            StartUserCommand(current.onNear);
+            if (current.once)
             {
                 g_stop = true;
             }
@@ -1327,6 +1380,72 @@ static int RunMonitor(const Options& options)
     while (!g_stop.load())
     {
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        const auto loopNow = std::chrono::steady_clock::now();
+        if (loopNow - lastConfigReload >= std::chrono::seconds(1))
+        {
+            Settings nextSettings;
+            std::wstring reloadError;
+            if (BuildSettings(options, nextSettings, reloadError, false))
+            {
+                bool becameReady = false;
+                bool becameWaiting = false;
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    const bool hadIrk = !settings.irk.empty();
+                    const bool hasIrk = !nextSettings.irk.empty();
+                    if (settings.irkHex != nextSettings.irkHex)
+                    {
+                        ResetRuntime(runtime);
+                    }
+                    settings = nextSettings;
+                    becameReady = !hadIrk && hasIrk;
+                    becameWaiting = hadIrk && !hasIrk;
+                }
+                if (becameReady)
+                {
+                    hasLoggedWaiting = false;
+                    LogLine(nextSettings, L"INFO", L"IRK configured; monitor is now detecting the trusted device");
+                }
+                else if (becameWaiting)
+                {
+                    hasLoggedWaiting = true;
+                    ClearProviderUnlockState(nextSettings.statePath);
+                    WriteMonitorWaitingState(nextSettings.signalStatePath, L"missing_irk");
+                    LogLine(nextSettings, L"INFO", L"IRK removed or invalid; monitor is waiting for config");
+                }
+            }
+            else
+            {
+                Settings current;
+                {
+                    std::lock_guard<std::mutex> guard(mutex);
+                    current = settings;
+                }
+                LogLine(current, L"WARN", L"could not reload monitor config: " + reloadError);
+            }
+            lastConfigReload = loopNow;
+        }
+
+        Settings current;
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            current = settings;
+        }
+        if (current.irk.empty())
+        {
+            if (!hasLoggedWaiting)
+            {
+                LogLine(current, L"INFO", L"no IRK configured; monitor is waiting");
+                hasLoggedWaiting = true;
+            }
+            if (loopNow - lastWaitingStateWrite >= std::chrono::seconds(5))
+            {
+                WriteMonitorWaitingState(current.signalStatePath, L"missing_irk");
+                lastWaitingStateWrite = loopNow;
+            }
+            continue;
+        }
+
         std::lock_guard<std::mutex> guard(mutex);
         if (!runtime.hasBeenNear || runtime.state == L"away" || !runtime.lastPresentAt.has_value())
         {
@@ -1343,19 +1462,19 @@ static int RunMonitor(const Options& options)
         runtime.state = L"away";
         runtime.nearHits = 0;
         runtime.bestRssi.reset();
-        LogLine(settings, L"INFO", L"away: last=" + runtime.lastAddress + L", missing_or_weak_for=" +
+        LogLine(current, L"INFO", L"away: last=" + runtime.lastAddress + L", missing_or_weak_for=" +
             std::to_wstring(elapsed) + L"s");
-        if (settings.credentialProviderEnabled)
+        if (current.credentialProviderEnabled)
         {
-            ClearProviderUnlockState(settings.statePath);
+            ClearProviderUnlockState(current.statePath);
         }
-        StartUserCommand(settings.onAway);
-        if (settings.lockOnAway)
+        StartUserCommand(current.onAway);
+        if (current.lockOnAway)
         {
-            LogLine(settings, L"INFO", L"locking workstation");
+            LogLine(current, L"INFO", L"locking workstation");
             LockWorkStation();
         }
-        if (settings.once)
+        if (current.once)
         {
             g_stop = true;
         }
@@ -1363,7 +1482,12 @@ static int RunMonitor(const Options& options)
 
     watcher.Received(token);
     watcher.Stop();
-    LogLine(settings, L"INFO", L"native monitor stopped");
+    Settings finalSettings;
+    {
+        std::lock_guard<std::mutex> guard(mutex);
+        finalSettings = settings;
+    }
+    LogLine(finalSettings, L"INFO", L"native monitor stopped");
     return 0;
 }
 

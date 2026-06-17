@@ -90,7 +90,7 @@ if (Test-Path $ZipPath) {
 
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 
-foreach ($file in @("README.md", "watchunlock.cmd", "watchunlock.ps1", "web.cmd", "web-stop.cmd")) {
+foreach ($file in @("README.md", "watchunlock.cmd", "watchunlock.ps1", "monitor.cmd", "web.cmd", "web-stop.cmd")) {
     Copy-RequiredFile -Source (Join-Path $Root $file) -Destination (Join-Path $Stage $file)
 }
 

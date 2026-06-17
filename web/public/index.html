@@ -38,6 +38,11 @@
             <button id="startMonitorBtn">启动</button>
             <button class="secondary" id="stopMonitorBtn">停止</button>
           </div>
+          <label class="toggle startup-toggle">
+            <input id="startupToggle" type="checkbox">
+            <span>开机自启动 Monitor</span>
+          </label>
+          <p class="path" id="startupStatus">未启用开机自启动</p>
           <div class="signal-card" id="signalCard">
             <div class="signal-main">-- dBm</div>
             <div class="signal-meta">等待 Monitor 命中设备</div>
@@ -50,24 +55,24 @@
         <section class="panel">
           <div class="panel-head">
             <h2>蓝牙设备</h2>
-            <div class="button-row compact">
-              <button class="secondary" id="loadKeysBtn">读取 IRK</button>
-              <button class="secondary" id="pairedBtn">已配对</button>
-              <button class="secondary" id="scanBtn">扫描</button>
-            </div>
+            <button id="scanBtn">扫描选择设备</button>
           </div>
 
-          <p class="notice">已连接/已配对设备不一定会出现在“扫描”里；“扫描”只看正在发 BLE 广播的设备。先点“已配对”确认 Windows 看到设备，再用“读取 IRK”和“测试匹配”做解锁识别。</p>
-          <p class="selected-device" id="selectedDevice">尚未选择配对设备</p>
+          <p class="notice">点击扫描会同时显示附近广播和 Windows 已配对设备。能通过 IRK 匹配的设备会标记“可自动配置”，点击后会自动填入并保存。</p>
+          <p class="selected-device" id="selectedDevice">尚未选择设备</p>
 
           <form id="deviceForm" class="grid-form">
             <label>
               <span>设备名称</span>
               <input name="deviceName" autocomplete="off" placeholder="Apple Watch / iPhone">
             </label>
+            <label>
+              <span>设备地址</span>
+              <input name="deviceAddress" autocomplete="off" spellcheck="false" placeholder="自动填入">
+            </label>
             <label class="wide">
               <span>IRK</span>
-              <input name="irk" autocomplete="off" spellcheck="false" placeholder="32 位十六进制">
+              <input name="irk" autocomplete="off" spellcheck="false" placeholder="扫描选择后自动填入，也可以手动粘贴">
             </label>
             <label>
               <span>靠近阈值</span>
@@ -94,22 +99,10 @@
               <span>远离自动锁屏</span>
             </label>
             <div class="form-actions wide">
-              <button type="submit">保存蓝牙</button>
-              <button type="button" class="secondary" id="testDeviceBtn">测试匹配</button>
-              <button type="button" class="danger" id="deleteDeviceBtn">删除蓝牙</button>
+              <button type="submit">保存设置</button>
+              <button type="button" class="danger" id="deleteDeviceBtn">删除设备</button>
             </div>
           </form>
-
-          <div class="split">
-            <div>
-              <h3>已配对 IRK</h3>
-              <div class="list" id="keyList"></div>
-            </div>
-            <div>
-              <h3>已配对/广播/测试结果</h3>
-              <div class="list" id="resultList"></div>
-            </div>
-          </div>
         </section>
 
         <section class="panel">
@@ -147,6 +140,19 @@
         </section>
       </section>
     </main>
+
+    <div class="modal" id="deviceDialog" hidden>
+      <div class="modal-panel">
+        <div class="panel-head">
+          <div>
+            <h2>选择蓝牙设备</h2>
+            <p class="path" id="deviceDialogHint">正在扫描附近设备并读取已配对 IRK</p>
+          </div>
+          <button class="icon-btn" id="closeDeviceDialogBtn" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div class="list device-list" id="devicePickerList"></div>
+      </div>
+    </div>
 
     <footer class="footer">
       Copyright (c) 2026 JACK &lt;2518926462@qq.com&gt;

@@ -9,6 +9,7 @@ https://www.v2ex.com/t/1172240
 现在仓库分成两部分：
 
 - `watchunlock.cmd` / `watchunlock.ps1`: 扫描 BLE、用 IRK 识别 Apple 隐私地址、判断靠近/远离、写入解锁状态、远离锁屏。
+- `monitor.cmd`: 独立启动后台 Monitor，不启动 Web。
 - `credential-provider\`: Windows Credential Provider 原生 DLL，运行在 LogonUI 里，靠近窗口有效时读取配置里的 Windows 账号密码并自动提交。
 
 ## 当前能力
@@ -41,7 +42,7 @@ web.cmd
 
 http://127.0.0.1:8765
 
-页面可以读取已配对 IRK、扫描 BLE、保存/删除当前蓝牙设备、保存 Windows 账号密码、查看 Provider 和 Monitor 状态。
+页面可以读取已配对 IRK、扫描 BLE、保存/删除当前蓝牙设备、保存 Windows 账号密码、查看 Provider 和 Monitor 状态，并选择是否开机自启动后台 Monitor。
 
 也可以继续使用命令行。
 
@@ -62,6 +63,8 @@ watchunlock.cmd set-credential -Username ".\alice"
 ```cmd
 watchunlock.cmd set-credential -Username "MicrosoftAccount\name@example.com"
 ```
+
+如果填写的是纯本地用户名，例如 `Administrator`，程序会自动按本机账号处理并提交为 `COMPUTERNAME\Administrator`。
 
 ## 编译并安装 Credential Provider
 
@@ -84,15 +87,41 @@ install.cmd
 watchunlock.cmd install-provider
 ```
 
-## 运行
-
-保持 monitor 常驻：
+测试 Credential Provider 是否能用已保存凭据自动解锁：
 
 ```cmd
-watchunlock.cmd monitor
+watchunlock.cmd test-unlock
 ```
 
-锁屏后，手机/手表靠近并满足 RSSI 阈值时，monitor 会打开一个短期解锁窗口，Credential Provider 会自动提交配置里的 Windows 凭据。设备远离超过 `AwaySeconds` 后会自动锁屏。
+这个命令会先校验已保存的 Windows 凭据和 Provider 注册状态，然后立即锁屏，默认 3 秒后写入一次测试解锁窗口。如果自动解锁失败，手动登录后运行 `watchunlock.cmd provider-log` 查看 Provider 是否被 LogonUI 加载、是否收到 unlock state、是否提交失败。可用 `-DelaySeconds 5` 调整锁屏后等待时间。
+
+## 运行
+
+Web 只用于配置，日常监听用独立 Monitor 启动：
+
+```cmd
+monitor.cmd
+```
+
+也可以用命令启动/停止后台 Monitor：
+
+```cmd
+watchunlock.cmd start-monitor
+watchunlock.cmd stop-monitor
+watchunlock.cmd monitor-status
+```
+
+锁屏后，手机/手表靠近并满足 RSSI 阈值时，Monitor 会打开一个短期解锁窗口，Credential Provider 会自动提交配置里的 Windows 凭据。设备远离超过 `AwaySeconds` 后会自动锁屏。
+
+开机自启动只启动后台 Monitor，不启动 Web：
+
+```cmd
+watchunlock.cmd enable-startup
+watchunlock.cmd disable-startup
+watchunlock.cmd startup-status
+```
+
+也可以在 Web 页面 Monitor 卡片里勾选“开机自启动 Monitor”。
 
 ## 常用命令
 
@@ -158,6 +187,10 @@ native-monitor\bin\x64\watchunlock-native.exe scan-test --seconds 8
 ```
 
 After the native monitor is built, both `web.cmd` and `watchunlock.cmd monitor` automatically prefer `native-monitor\bin\x64\watchunlock-native.exe`. The PowerShell monitor remains as a fallback when the native executable is not present.
+
+The native monitor is designed to stay running. If no IRK is configured yet, it waits and reports `waiting`; after the Web UI saves an IRK, the same monitor process starts detecting the trusted device without being restarted.
+
+In the Web UI, use **扫描选择设备** as the main Bluetooth flow. It combines live BLE advertisements, paired Windows Bluetooth devices, and paired IRK registry keys. When a scanned random address can be resolved by an IRK, the device is marked as available for automatic configuration; clicking it fills and saves the Bluetooth settings.
 
 ## CI, Package, Release
 

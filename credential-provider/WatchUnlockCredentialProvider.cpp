@@ -20,9 +20,52 @@ static const wchar_t* kProviderName = L"WatchUnlock";
 static const wchar_t* kProviderGuidString = L"{B2B7A4C9-6170-4B34-8B95-A4B3E7BBEA6C}";
 static const wchar_t* kDefaultConfigPath = L"C:\\ProgramData\\WatchUnlockCli\\config.json";
 static const wchar_t* kDefaultStatePath = L"C:\\ProgramData\\WatchUnlockCli\\state.json";
+static const wchar_t* kDefaultLogPath = L"C:\\ProgramData\\WatchUnlockCli\\provider.log";
 
 static long g_dllRefCount = 0;
 static std::wstring g_lastSubmittedToken;
+
+static void LogProviderEvent(const std::wstring& message)
+{
+    CreateDirectoryW(L"C:\\ProgramData\\WatchUnlockCli", nullptr);
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t prefix[96] = {};
+    StringCchPrintfW(prefix, ARRAYSIZE(prefix), L"[%04u-%02u-%02u %02u:%02u:%02u][pid=%lu] ",
+                     st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId());
+
+    const std::wstring line = std::wstring(prefix) + message + L"\r\n";
+    const int bytesNeeded = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (bytesNeeded <= 1)
+    {
+        return;
+    }
+
+    std::vector<char> bytes(static_cast<size_t>(bytesNeeded - 1));
+    if (!WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, bytes.data(), bytesNeeded, nullptr, nullptr))
+    {
+        return;
+    }
+
+    HANDLE file = CreateFileW(kDefaultLogPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    DWORD written = 0;
+    WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    CloseHandle(file);
+}
+
+static std::wstring Hex32(unsigned long value)
+{
+    wchar_t text[16] = {};
+    StringCchPrintfW(text, ARRAYSIZE(text), L"0x%08lX", value);
+    return text;
+}
 
 static void SecureClearString(std::wstring& text)
 {
@@ -311,11 +354,12 @@ static bool LoadConfig(std::wstring& username, std::wstring& password, std::wstr
     return UnprotectMachineText(protectedPassword, password);
 }
 
-static bool LoadUnlockState(const std::wstring& statePath, std::wstring& token)
+static bool LoadUnlockState(const std::wstring& statePath, std::wstring& token, std::wstring* reasonOut = nullptr)
 {
     std::wstring json;
     if (!ReadTextFile(statePath, json))
     {
+        if (reasonOut) *reasonOut = L"state file not readable: " + statePath;
         return false;
     }
 
@@ -324,26 +368,48 @@ static bool LoadUnlockState(const std::wstring& statePath, std::wstring& token)
         !JsonString(json, L"unlockToken", token) ||
         token.empty())
     {
+        if (reasonOut) *reasonOut = L"state missing allowUnlockUntil/unlockToken";
         return false;
     }
 
-    return allowUntil >= UnixNow() && token != g_lastSubmittedToken;
+    if (allowUntil < UnixNow())
+    {
+        if (reasonOut)
+        {
+            reasonOut->assign(L"unlock window expired allowUntil=");
+            reasonOut->append(std::to_wstring(allowUntil));
+            reasonOut->append(L" now=");
+            reasonOut->append(std::to_wstring(UnixNow()));
+        }
+        return false;
+    }
+    if (token == g_lastSubmittedToken)
+    {
+        if (reasonOut) *reasonOut = L"unlock token already submitted";
+        return false;
+    }
+
+    if (reasonOut) *reasonOut = L"allowed";
+    return true;
 }
 
-static bool CanAutoUnlock(std::wstring* tokenOut = nullptr)
+static bool CanAutoUnlock(std::wstring* tokenOut = nullptr, std::wstring* reasonOut = nullptr)
 {
     std::wstring username;
     std::wstring password;
     std::wstring statePath;
     if (!LoadConfig(username, password, statePath))
     {
+        if (reasonOut) *reasonOut = L"config or DPAPI credential not readable";
         return false;
     }
 
     std::wstring token;
-    if (!LoadUnlockState(statePath, token))
+    std::wstring stateReason;
+    if (!LoadUnlockState(statePath, token, &stateReason))
     {
         SecureClearString(password);
+        if (reasonOut) *reasonOut = stateReason;
         return false;
     }
 
@@ -352,6 +418,7 @@ static bool CanAutoUnlock(std::wstring* tokenOut = nullptr)
         *tokenOut = token;
     }
     SecureClearString(password);
+    if (reasonOut) *reasonOut = L"allowed";
     return true;
 }
 
@@ -378,6 +445,39 @@ static HRESULT GetAuthenticationPackage(ULONG* package)
     status = LsaLookupAuthenticationPackage(lsa, &name, package);
     LsaDeregisterLogonProcess(lsa);
     return HRESULT_FROM_NT(status);
+}
+
+static std::wstring LocalComputerName()
+{
+    wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD size = ARRAYSIZE(name);
+    if (GetComputerNameW(name, &size) && size > 0)
+    {
+        return std::wstring(name, size);
+    }
+    return L".";
+}
+
+static std::wstring NormalizeUsernameForLogon(const std::wstring& username)
+{
+    if (username.empty())
+    {
+        return username;
+    }
+
+    if (username.size() > 2 && username[0] == L'.' && (username[1] == L'\\' || username[1] == L'/'))
+    {
+        return LocalComputerName() + L"\\" + username.substr(2);
+    }
+
+    if (username.find(L'\\') == std::wstring::npos &&
+        username.find(L'/') == std::wstring::npos &&
+        username.find(L'@') == std::wstring::npos)
+    {
+        return LocalComputerName() + L"\\" + username;
+    }
+
+    return username;
 }
 
 static HRESULT PackCredentials(CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* serialization, std::wstring& token)
@@ -411,8 +511,15 @@ static HRESULT PackCredentials(CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* ser
         return hr;
     }
 
+    const std::wstring logonUsername = NormalizeUsernameForLogon(username);
+    if (logonUsername != username)
+    {
+        LogProviderEvent(L"PackCredentials normalized local username for LogonUI");
+    }
+    std::wstring packedUsername = logonUsername;
+
     DWORD packedSize = 0;
-    CredPackAuthenticationBufferW(0, &username[0], &password[0], nullptr, &packedSize);
+    CredPackAuthenticationBufferW(0, &packedUsername[0], &password[0], nullptr, &packedSize);
     if (packedSize == 0)
     {
         SecureClearString(password);
@@ -426,7 +533,7 @@ static HRESULT PackCredentials(CREDENTIAL_PROVIDER_CREDENTIAL_SERIALIZATION* ser
         return E_OUTOFMEMORY;
     }
 
-    if (!CredPackAuthenticationBufferW(0, &username[0], &password[0], packed, &packedSize))
+    if (!CredPackAuthenticationBufferW(0, &packedUsername[0], &password[0], packed, &packedSize))
     {
         hr = HRESULT_FROM_WIN32(GetLastError());
         CoTaskMemFree(packed);
@@ -449,10 +556,12 @@ public:
     WatchUnlockCredential() : _ref(1)
     {
         InterlockedIncrement(&g_dllRefCount);
+        LogProviderEvent(L"credential constructed");
     }
 
     ~WatchUnlockCredential()
     {
+        LogProviderEvent(L"credential destroyed");
         InterlockedDecrement(&g_dllRefCount);
     }
 
@@ -492,10 +601,13 @@ public:
 
     IFACEMETHODIMP SetSelected(BOOL* autoLogon)
     {
+        std::wstring reason;
+        const bool allowed = CanAutoUnlock(nullptr, &reason);
         if (autoLogon)
         {
-            *autoLogon = CanAutoUnlock() ? TRUE : FALSE;
+            *autoLogon = allowed ? TRUE : FALSE;
         }
+        LogProviderEvent(std::wstring(L"credential SetSelected allowed=") + (allowed ? L"true" : L"false") + L" reason=" + reason);
         return S_OK;
     }
 
@@ -572,16 +684,20 @@ public:
         {
             g_lastSubmittedToken = token;
             *response = CPGSR_RETURN_CREDENTIAL_FINISHED;
+            LogProviderEvent(L"GetSerialization success; returning packed credential");
             return S_OK;
         }
 
+        LogProviderEvent(L"GetSerialization did not pack credential; hr=" + Hex32(static_cast<unsigned long>(hr)));
         DupString(L"Trusted device is not nearby, or the unlock window expired.", statusText);
         *statusIcon = CPSI_ERROR;
         return S_OK;
     }
 
-    IFACEMETHODIMP ReportResult(NTSTATUS, NTSTATUS, wchar_t** statusText, CREDENTIAL_PROVIDER_STATUS_ICON* statusIcon)
+    IFACEMETHODIMP ReportResult(NTSTATUS status, NTSTATUS substatus, wchar_t** statusText, CREDENTIAL_PROVIDER_STATUS_ICON* statusIcon)
     {
+        LogProviderEvent(L"ReportResult status=" + Hex32(static_cast<unsigned long>(status)) +
+                         L" substatus=" + Hex32(static_cast<unsigned long>(substatus)));
         if (statusText)
         {
             *statusText = nullptr;
@@ -603,10 +719,12 @@ public:
     WatchUnlockProvider() : _ref(1), _usage(CPUS_INVALID), _events(nullptr), _adviseContext(0), _stopEvent(nullptr), _thread(nullptr)
     {
         InterlockedIncrement(&g_dllRefCount);
+        LogProviderEvent(L"provider constructed");
     }
 
     ~WatchUnlockProvider()
     {
+        LogProviderEvent(L"provider destroyed");
         StopWatcher();
         if (_events)
         {
@@ -649,6 +767,7 @@ public:
     IFACEMETHODIMP SetUsageScenario(CREDENTIAL_PROVIDER_USAGE_SCENARIO usage, DWORD)
     {
         _usage = usage;
+        LogProviderEvent(L"SetUsageScenario usage=" + std::to_wstring(static_cast<int>(usage)));
         if (usage == CPUS_LOGON || usage == CPUS_UNLOCK_WORKSTATION)
         {
             return S_OK;
@@ -660,6 +779,7 @@ public:
 
     IFACEMETHODIMP Advise(ICredentialProviderEvents* events, UINT_PTR context)
     {
+        LogProviderEvent(L"Advise called");
         if (_events)
         {
             _events->Release();
@@ -677,6 +797,7 @@ public:
 
     IFACEMETHODIMP UnAdvise()
     {
+        LogProviderEvent(L"UnAdvise called");
         StopWatcher();
         if (_events)
         {
@@ -734,14 +855,18 @@ public:
             return E_INVALIDARG;
         }
 
+        std::wstring reason;
+        const bool allowed = CanAutoUnlock(nullptr, &reason);
         *count = 1;
         *defaultCredential = 0;
-        *autoLogonWithDefault = CanAutoUnlock() ? TRUE : FALSE;
+        *autoLogonWithDefault = allowed ? TRUE : FALSE;
+        LogProviderEvent(std::wstring(L"GetCredentialCount allowed=") + (allowed ? L"true" : L"false") + L" reason=" + reason);
         return S_OK;
     }
 
     IFACEMETHODIMP GetCredentialAt(DWORD index, ICredentialProviderCredential** credential)
     {
+        LogProviderEvent(L"GetCredentialAt index=" + std::to_wstring(index));
         if (!credential || index != 0)
         {
             return E_INVALIDARG;
@@ -763,6 +888,7 @@ private:
         {
             return;
         }
+        LogProviderEvent(L"StartWatcher");
         _stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!_stopEvent)
         {
@@ -773,6 +899,7 @@ private:
 
     void StopWatcher()
     {
+        LogProviderEvent(L"StopWatcher");
         if (_stopEvent)
         {
             SetEvent(_stopEvent);
@@ -792,16 +919,25 @@ private:
 
     void WatchLoop()
     {
-        bool wasAllowed = CanAutoUnlock();
+        std::wstring reason;
+        bool wasAllowed = CanAutoUnlock(nullptr, &reason);
+        LogProviderEvent(std::wstring(L"WatchLoop started allowed=") + (wasAllowed ? L"true" : L"false") + L" reason=" + reason);
         while (_stopEvent && WaitForSingleObject(_stopEvent, 1000) == WAIT_TIMEOUT)
         {
-            const bool allowed = CanAutoUnlock();
-            if (allowed && !wasAllowed && _events)
+            std::wstring nextReason;
+            const bool allowed = CanAutoUnlock(nullptr, &nextReason);
+            if (allowed != wasAllowed)
             {
+                LogProviderEvent(std::wstring(L"WatchLoop allowed changed to ") + (allowed ? L"true" : L"false") + L" reason=" + nextReason);
+            }
+            if (allowed && _events)
+            {
+                LogProviderEvent(L"WatchLoop calling CredentialsChanged");
                 _events->CredentialsChanged(_adviseContext);
             }
             wasAllowed = allowed;
         }
+        LogProviderEvent(L"WatchLoop stopped");
     }
 
     long _ref;
@@ -912,8 +1048,10 @@ STDAPI DllCanUnloadNow()
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv)
 {
+    LogProviderEvent(L"DllGetClassObject called");
     if (clsid != CLSID_WatchUnlockProvider)
     {
+        LogProviderEvent(L"DllGetClassObject class not available");
         return CLASS_E_CLASSNOTAVAILABLE;
     }
 
@@ -929,6 +1067,7 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, void** ppv)
 
 STDAPI DllRegisterServer()
 {
+    LogProviderEvent(L"DllRegisterServer called");
     wchar_t modulePath[MAX_PATH] = {};
     if (!GetModuleFileNameW(reinterpret_cast<HMODULE>(&__ImageBase), modulePath, ARRAYSIZE(modulePath)))
     {
@@ -955,6 +1094,7 @@ STDAPI DllRegisterServer()
 
 STDAPI DllUnregisterServer()
 {
+    LogProviderEvent(L"DllUnregisterServer called");
     std::wstring providerPath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Authentication\\Credential Providers\\";
     providerPath += kProviderGuidString;
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, providerPath.c_str());

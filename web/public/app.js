@@ -1,13 +1,11 @@
 // Copyright (c) 2026 JACK <2518926462@qq.com>
 
 const token = document.querySelector('meta[name="watchunlock-token"]').content;
-
 const $ = (selector) => document.querySelector(selector);
 
 const state = {
   status: null,
-  selectedBluetooth: null,
-  pairedDevices: [],
+  discoveredDevices: [],
 };
 
 async function api(path, options = {}) {
@@ -41,34 +39,48 @@ function setBusy(button, busy) {
   button.disabled = busy;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;",
+  }[ch]));
+}
+
 function chip(text, kind = "neutral") {
-  return `<span class="chip ${kind}">${text}</span>`;
+  return `<span class="chip ${kind}">${escapeHtml(text)}</span>`;
 }
 
 function valueOrDash(value) {
   return value === undefined || value === null || value === "" ? "未设置" : String(value);
 }
 
-function normalizeBluetoothAddress(value) {
-  return String(value || "").replace(/[^0-9a-f]/gi, "").toLowerCase();
+function shortIrk(value) {
+  const text = String(value || "");
+  return text.length > 16 ? `${text.slice(0, 8)}…${text.slice(-8)}` : text;
 }
 
-function updateSelectedDevice() {
-  const selected = state.selectedBluetooth;
-  $("#selectedDevice").textContent = selected
-    ? `已选择：${selected.name || "未命名设备"}${selected.address ? ` · ${selected.address}` : ""}。现在点“读取 IRK”会优先匹配这个设备。`
-    : "尚未选择配对设备";
+function sourceLabel(source) {
+  if (source === "scan") return "广播";
+  if (source === "paired") return "已配对";
+  if (source === "irk") return "IRK";
+  return source || "设备";
 }
 
 function renderSignal(monitor) {
   const signal = monitor?.signal || {};
   const running = Boolean(monitor?.running);
   const hasRssi = Number.isFinite(signal.rssi);
+  const waiting = signal.presence === "waiting";
   const ageText = signal.ageSeconds === null || signal.ageSeconds === undefined ? "" : ` · ${signal.ageSeconds}s 前`;
   const presenceText = signal.presence ? ` · ${signal.presence}` : "";
+  const waitingText = waiting ? "Monitor 正在运行，等待配置 IRK" : "Monitor 运行中，等待目标广播";
+
   $("#signalCard").innerHTML = `
     <div class="signal-main">${hasRssi ? `${signal.rssi} dBm` : "-- dBm"}</div>
-    <div class="signal-meta">${signal.address || (running ? "Monitor 运行中，等待目标广播" : "Monitor 未运行")}${presenceText}${ageText}</div>
+    <div class="signal-meta">${escapeHtml(signal.address || (running ? waitingText : "Monitor 未运行"))}${escapeHtml(presenceText)}${escapeHtml(ageText)}</div>
     <div class="signal-sub">best ${Number.isFinite(signal.bestRssi) ? `${signal.bestRssi} dBm` : "--"} · hits ${signal.nearHits || 0}</div>
   `;
   $("#signalCard").className = `signal-card ${hasRssi ? (signal.presence || "seen") : (running ? "waiting" : "idle")}`;
@@ -83,60 +95,73 @@ function renderMonitorControls(monitor) {
   stopButton.disabled = !running;
 }
 
-function findPairedDeviceByAddress(address) {
-  const normalized = normalizeBluetoothAddress(address);
-  if (!normalized) return null;
-  return state.pairedDevices.find(device => normalizeBluetoothAddress(device.address) === normalized) || null;
+function renderStartupControls(startup) {
+  const enabled = Boolean(startup?.enabled);
+  const toggle = $("#startupToggle");
+  toggle.checked = enabled;
+  $("#startupStatus").textContent = enabled
+    ? `已启用：${startup.taskName || "WatchUnlock Monitor"}`
+    : "未启用开机自启动";
 }
 
-async function ensurePairedDevices() {
-  if (state.pairedDevices.length > 0) return state.pairedDevices;
-  try {
-    const data = await api("/api/paired");
-    state.pairedDevices = Array.isArray(data.devices) ? data.devices : [];
-  } catch {
-    state.pairedDevices = [];
-  }
-  return state.pairedDevices;
+function isEditingForm(form) {
+  return form && document.activeElement && form.contains(document.activeElement);
 }
 
-function renderStatus(status) {
+function renderStatus(status, options = {}) {
+  const syncForms = options.syncForms !== false;
   state.status = status;
   const config = status.config || {};
   const provider = status.provider || {};
   const monitor = status.monitor || {};
+  const startup = status.startup || {};
 
   $("#statusStrip").innerHTML = [
     chip(config.irk ? "蓝牙已配置" : "未选蓝牙", config.irk ? "ok" : "warn"),
     chip(config.hasCredential ? "凭据已保存" : "未保存凭据", config.hasCredential ? "ok" : "warn"),
     chip(provider.registered ? "Provider 已注册" : "Provider 未注册", provider.registered ? "ok" : "bad"),
     chip(monitor.running ? "Monitor 运行中" : "Monitor 已停止", monitor.running ? "ok" : "warn"),
+    chip(startup.enabled ? "自启动已开" : "自启动未开", startup.enabled ? "ok" : "warn"),
   ].join("");
 
   $("#facts").innerHTML = `
-    <dt>配置文件</dt><dd>${config.exists ? config.path : "未创建"}</dd>
-    <dt>当前设备</dt><dd>${valueOrDash(config.deviceName)}</dd>
-    <dt>IRK</dt><dd class="mono">${valueOrDash(config.irk)}</dd>
-    <dt>账号</dt><dd>${valueOrDash(config.username)}</dd>
+    <dt>配置文件</dt><dd>${escapeHtml(config.exists ? config.path : "未创建")}</dd>
+    <dt>当前设备</dt><dd>${escapeHtml(valueOrDash(config.deviceName))}</dd>
+    <dt>设备地址</dt><dd>${escapeHtml(valueOrDash(config.deviceAddress))}</dd>
+    <dt>IRK</dt><dd class="mono">${escapeHtml(valueOrDash(shortIrk(config.irk)))}</dd>
+    <dt>账号</dt><dd>${escapeHtml(valueOrDash(config.username))}</dd>
     <dt>Provider</dt><dd>${provider.registered ? "已注册" : "未注册"}</dd>
-    <dt>Monitor</dt><dd>${monitor.running ? `PID ${monitor.pid}` : "未运行"}</dd>
+    <dt>Monitor</dt><dd>${escapeHtml(monitor.running ? `PID ${monitor.pid}` : "未运行")}</dd>
+    <dt>自启动</dt><dd>${escapeHtml(startup.enabled ? "已启用" : "未启用")}</dd>
   `;
+
   renderMonitorControls(monitor);
+  renderStartupControls(startup);
   renderSignal(monitor);
 
   const deviceForm = $("#deviceForm");
-  deviceForm.deviceName.value = config.deviceName || "";
-  deviceForm.irk.value = config.irk || "";
-  deviceForm.nearRssi.value = config.nearRssi ?? -68;
-  deviceForm.awayRssi.value = config.awayRssi ?? -86;
-  deviceForm.awaySeconds.value = config.awaySeconds ?? 30;
-  deviceForm.nearHits.value = config.nearHits ?? 2;
-  deviceForm.unlockWindowSeconds.value = config.unlockWindowSeconds ?? 30;
-  deviceForm.lockOnAway.checked = config.lockOnAway !== false;
+  if (syncForms || !isEditingForm(deviceForm)) {
+    deviceForm.deviceName.value = config.deviceName || "";
+    deviceForm.deviceAddress.value = config.deviceAddress || "";
+    deviceForm.irk.value = config.irk || "";
+    deviceForm.nearRssi.value = config.nearRssi ?? -68;
+    deviceForm.awayRssi.value = config.awayRssi ?? -86;
+    deviceForm.awaySeconds.value = config.awaySeconds ?? 30;
+    deviceForm.nearHits.value = config.nearHits ?? 2;
+    deviceForm.unlockWindowSeconds.value = config.unlockWindowSeconds ?? 30;
+    deviceForm.lockOnAway.checked = config.lockOnAway !== false;
+  }
+
+  const selectedText = config.irk
+    ? `当前设备：${config.deviceName || "未命名设备"}${config.deviceAddress ? ` · ${config.deviceAddress}` : ""}`
+    : "尚未选择设备";
+  $("#selectedDevice").textContent = selectedText;
 
   const credentialForm = $("#credentialForm");
-  credentialForm.username.value = config.username || "";
-  credentialForm.unlockWindowSeconds.value = config.unlockWindowSeconds ?? 30;
+  if (syncForms || !isEditingForm(credentialForm)) {
+    credentialForm.username.value = config.username || "";
+    credentialForm.unlockWindowSeconds.value = config.unlockWindowSeconds ?? 30;
+  }
   $("#providerPath").textContent = provider.dllPath || "";
 }
 
@@ -148,172 +173,17 @@ async function loadStatus() {
 
 function renderList(el, items, renderItem, emptyText) {
   if (!items || items.length === 0) {
-    el.innerHTML = `<div class="empty">${emptyText}</div>`;
+    el.innerHTML = `<div class="empty">${escapeHtml(emptyText)}</div>`;
     return;
   }
   el.innerHTML = items.map(renderItem).join("");
-}
-
-async function loadKeys() {
-  const button = $("#loadKeysBtn");
-  setBusy(button, true);
-  try {
-    await ensurePairedDevices();
-    const data = await api("/api/keys");
-    const selectedAddress = normalizeBluetoothAddress(state.selectedBluetooth?.address);
-    const keys = [...(data.keys || [])].map(item => ({
-      ...item,
-      pairedDevice: findPairedDeviceByAddress(item.device),
-      isSelectedMatch: selectedAddress && normalizeBluetoothAddress(item.device) === selectedAddress,
-    })).sort((left, right) => Number(right.isSelectedMatch) - Number(left.isSelectedMatch));
-    renderList($("#keyList"), keys, (item, index) => `
-      <div class="item ${item.isSelectedMatch ? "selected" : ""}">
-        <div class="item-main">
-          <div>
-            <div class="item-title">${item.pairedDevice?.name || `未知设备 ${index + 1}`}${item.isSelectedMatch ? " · 匹配已选设备" : ""}</div>
-            <div class="meta">${item.device || "-"}${item.pairedDevice?.kind ? ` · ${item.pairedDevice.kind}` : ""} · Adapter ${item.adapter || "-"}${state.selectedBluetooth && !item.isSelectedMatch ? " · 与已选设备地址不一致" : ""}</div>
-          </div>
-          <div class="button-row compact">
-            <button class="secondary" data-use-irk="${item.irk}" data-device="${item.device || ""}" data-device-name="${item.pairedDevice?.name || state.selectedBluetooth?.name || ""}">选择</button>
-            <button class="secondary" data-use-irk="${item.irkReversed || ""}" data-device="${item.device || ""}" data-device-name="${item.pairedDevice?.name || state.selectedBluetooth?.name || ""}">反向</button>
-          </div>
-        </div>
-        <div class="mono">IRK ${item.irk || ""}</div>
-        <div class="mono">反向 ${item.irkReversed || ""}</div>
-      </div>
-    `, data.output || "没有读到 IRK");
-    $("#keyList").querySelectorAll("[data-use-irk]").forEach(button => {
-      button.addEventListener("click", () => {
-        if (!button.dataset.useIrk) return;
-        $("#deviceForm").irk.value = button.dataset.useIrk;
-        $("#deviceForm").deviceName.value = button.dataset.deviceName || button.dataset.device || "Paired BLE device";
-        toast("已填入 IRK");
-      });
-    });
-    const matchedKey = keys.find(item => item.isSelectedMatch);
-    if (matchedKey) {
-      $("#deviceForm").irk.value = matchedKey.irk || "";
-      $("#deviceForm").deviceName.value = state.selectedBluetooth?.name || matchedKey.device || "Paired BLE device";
-      toast("已自动匹配并填入 IRK");
-    } else if (state.selectedBluetooth && keys.length > 0) {
-      toast("读取到 IRK，但没有找到与已选设备地址一致的项", "bad");
-    } else if (data.output && keys.length === 0) {
-      toast(data.output, "bad");
-    }
-  } catch (error) {
-    toast(error.message, "bad");
-  } finally {
-    setBusy(button, false);
-  }
-}
-
-async function loadPairedDevices() {
-  const button = $("#pairedBtn");
-  setBusy(button, true);
-  try {
-    const data = await api("/api/paired");
-    state.pairedDevices = Array.isArray(data.devices) ? data.devices : [];
-    renderList($("#resultList"), state.pairedDevices, (item, index) => `
-      <div class="item">
-        <div class="item-main">
-          <div>
-            <div class="item-title">${item.name || `已配对设备 ${index + 1}`}</div>
-            <div class="meta">${item.kind || "Bluetooth"}${item.address ? ` · ${item.address}` : ""} · paired=${item.isPaired} · enabled=${item.isEnabled}</div>
-          </div>
-          <button class="secondary" data-device-name="${item.name || ""}" data-device-address="${item.address || ""}" data-device-kind="${item.kind || ""}">选择设备</button>
-        </div>
-        <div class="mono">${item.id || ""}</div>
-      </div>
-    `, data.output || "Windows 没有返回已配对蓝牙设备");
-    $("#resultList").querySelectorAll("[data-device-name]").forEach(button => {
-      button.addEventListener("click", () => {
-        state.selectedBluetooth = {
-          name: button.dataset.deviceName || "Paired Bluetooth device",
-          address: button.dataset.deviceAddress || "",
-          kind: button.dataset.deviceKind || "",
-        };
-        $("#deviceForm").deviceName.value = state.selectedBluetooth.name;
-        updateSelectedDevice();
-        toast("已选择设备，现在点“读取 IRK”匹配密钥");
-      });
-    });
-    toast(state.pairedDevices.length ? "已读取配对设备" : "Windows 没有返回配对设备", state.pairedDevices.length ? "ok" : "bad");
-  } catch (error) {
-    toast(error.message, "bad");
-  } finally {
-    setBusy(button, false);
-  }
-}
-
-async function scanBle() {
-  const button = $("#scanBtn");
-  setBusy(button, true);
-  try {
-    const data = await api("/api/scan", {
-      method: "POST",
-      body: { seconds: 8, rssiMin: -100 },
-    });
-    renderList($("#resultList"), data.devices, item => `
-      <div class="item">
-        <div class="item-main">
-          <div>
-            <div class="item-title">${item.name || "未命名设备"}</div>
-            <div class="meta">${item.address} · ${item.rssi} dBm</div>
-          </div>
-        </div>
-        <div class="mono">${(item.manufacturer || []).join(", ")}</div>
-      </div>
-    `, "没有收到 BLE 广播；已连接设备可能不会广播，请点“已配对”查看 Windows 连接/配对列表");
-    toast(data.devices.length ? "扫描完成" : "没有收到 BLE 广播", data.devices.length ? "ok" : "bad");
-  } catch (error) {
-    toast(error.message, "bad");
-  } finally {
-    setBusy(button, false);
-  }
-}
-
-async function testDevice() {
-  const form = $("#deviceForm");
-  const irk = form.irk.value.trim();
-  if (!irk) {
-    toast("先填写 IRK", "bad");
-    return;
-  }
-  const button = $("#testDeviceBtn");
-  setBusy(button, true);
-  try {
-    const data = await api("/api/resolve", {
-      method: "POST",
-      body: { irk, seconds: 20 },
-    });
-    renderList($("#resultList"), data.matches, item => `
-      <div class="item">
-        <div class="item-main">
-          <div>
-            <div class="item-title">MATCH ${item.address}</div>
-            <div class="meta">${item.rssi} dBm · ${item.name || "无名称"}</div>
-          </div>
-        </div>
-        <div class="mono">${item.match ? `${item.match.layout}/${item.match.keyOrder}` : ""}</div>
-      </div>
-    `, "20 秒内没有匹配到这个 IRK");
-    if (data.matches.length && data.irkUsed && data.irkUsed !== irk.replace(/[^0-9a-f]/gi, "").toUpperCase()) {
-      form.irk.value = data.irkUsed;
-      toast("反向 IRK 匹配成功，已自动填入正确 IRK");
-    } else {
-      toast(data.matches.length ? "已匹配到设备" : "没有匹配到设备", data.matches.length ? "ok" : "bad");
-    }
-  } catch (error) {
-    toast(error.message, "bad");
-  } finally {
-    setBusy(button, false);
-  }
 }
 
 function readDeviceForm() {
   const form = $("#deviceForm");
   return {
     deviceName: form.deviceName.value.trim(),
+    deviceAddress: form.deviceAddress.value.trim(),
     irk: form.irk.value.trim(),
     nearRssi: Number(form.nearRssi.value),
     awayRssi: Number(form.awayRssi.value),
@@ -324,18 +194,109 @@ function readDeviceForm() {
   };
 }
 
-async function saveDevice(event) {
-  event.preventDefault();
-  const button = event.submitter;
+async function saveDeviceBody(body, button = null) {
   setBusy(button, true);
   try {
-    const data = await api("/api/device", { method: "POST", body: readDeviceForm() });
+    const data = await api("/api/device", { method: "POST", body });
     toast(data.output || "蓝牙配置已保存");
     await loadStatus();
+    return true;
   } catch (error) {
+    toast(error.message, "bad");
+    return false;
+  } finally {
+    setBusy(button, false);
+  }
+}
+
+async function saveDevice(event) {
+  event.preventDefault();
+  await saveDeviceBody(readDeviceForm(), event.submitter);
+}
+
+function openDeviceDialog() {
+  $("#deviceDialog").hidden = false;
+}
+
+function closeDeviceDialog() {
+  $("#deviceDialog").hidden = true;
+}
+
+function renderDevicePicker(devices) {
+  const list = $("#devicePickerList");
+  renderList(list, devices, (item, index) => {
+    const title = item.name || "未命名设备";
+    const rssi = Number.isFinite(item.rssi) ? ` · ${item.rssi} dBm` : "";
+    const paired = item.paired ? " · 已配对" : "";
+    const canUse = Boolean(item.irk);
+    const manufacturer = (item.manufacturer || []).join(", ");
+    const source = sourceLabel(item.source);
+    const match = item.match?.type === "rpa" ? "IRK 匹配随机地址" : (item.irk ? "读取到 IRK" : "未匹配 IRK");
+    return `
+      <button class="device-option ${canUse ? "ready" : ""}" data-pick-index="${index}">
+        <span class="device-top">
+          <span>
+            <strong>${escapeHtml(title)}</strong>
+            <span class="meta">${escapeHtml(`${item.address || "无地址"}${rssi}${paired}`)}</span>
+          </span>
+          <span class="chip ${canUse ? "ok" : "warn"}">${canUse ? "可自动配置" : "无 IRK"}</span>
+        </span>
+        <span class="meta">${escapeHtml(`${source} · ${item.kind || "Bluetooth"} · ${match}`)}</span>
+        ${item.irk ? `<span class="mono">IRK ${escapeHtml(shortIrk(item.irk))}</span>` : ""}
+        ${manufacturer ? `<span class="mono">${escapeHtml(manufacturer)}</span>` : ""}
+      </button>
+    `;
+  }, "没有发现蓝牙设备");
+
+  list.querySelectorAll("[data-pick-index]").forEach((button) => {
+    button.addEventListener("click", () => pickDiscoveredDevice(Number(button.dataset.pickIndex), button));
+  });
+}
+
+async function scanDevices() {
+  const button = $("#scanBtn");
+  setBusy(button, true);
+  $("#deviceDialogHint").textContent = "正在扫描附近广播、读取已配对设备和 IRK";
+  state.discoveredDevices = [];
+  renderDevicePicker([]);
+  openDeviceDialog();
+
+  try {
+    const data = await api("/api/discover", {
+      method: "POST",
+      body: { seconds: 8, rssiMin: -100 },
+    });
+    state.discoveredDevices = Array.isArray(data.devices) ? data.devices : [];
+    renderDevicePicker(state.discoveredDevices);
+    $("#deviceDialogHint").textContent = `发现 ${state.discoveredDevices.length} 个条目 · 扫描引擎 ${data.engine || "unknown"}`;
+    toast(state.discoveredDevices.length ? "扫描完成" : "没有发现蓝牙设备", state.discoveredDevices.length ? "ok" : "bad");
+  } catch (error) {
+    $("#deviceDialogHint").textContent = "扫描失败";
+    renderDevicePicker([]);
     toast(error.message, "bad");
   } finally {
     setBusy(button, false);
+  }
+}
+
+async function pickDiscoveredDevice(index, button) {
+  const item = state.discoveredDevices[index];
+  if (!item) return;
+
+  const form = $("#deviceForm");
+  form.deviceName.value = item.name || item.address || "Bluetooth device";
+  form.deviceAddress.value = item.address || item.irkSourceAddress || "";
+
+  if (!item.irk) {
+    toast("这个设备没有匹配到 IRK。请确认它已和 Windows 配对，并用管理员权限启动 Web。", "bad");
+    return;
+  }
+
+  form.irk.value = item.irk;
+  const saved = await saveDeviceBody(readDeviceForm(), button);
+  if (saved) {
+    closeDeviceDialog();
+    toast("已自动填入并保存蓝牙设备");
   }
 }
 
@@ -348,6 +309,7 @@ async function deleteDevice() {
     toast(data.output || "蓝牙配置已删除");
     $("#deviceForm").irk.value = "";
     $("#deviceForm").deviceName.value = "";
+    $("#deviceForm").deviceAddress.value = "";
     await loadStatus();
   } catch (error) {
     toast(error.message, "bad");
@@ -421,6 +383,20 @@ async function stopMonitor() {
   }
 }
 
+async function setStartup(enabled, control) {
+  setBusy(control, true);
+  try {
+    const data = await api(enabled ? "/api/startup/enable" : "/api/startup/disable", { method: "POST", body: {} });
+    toast(data.output || (enabled ? "已启用开机自启动" : "已关闭开机自启动"));
+    await loadStatus();
+  } catch (error) {
+    toast(error.message, "bad");
+    await loadStatus();
+  } finally {
+    setBusy(control, false);
+  }
+}
+
 async function loadMonitorLog() {
   try {
     const data = await api("/api/logs/monitor");
@@ -433,7 +409,7 @@ async function loadMonitorLog() {
 async function refreshMonitorStatus() {
   try {
     const status = await api("/api/status");
-    renderStatus(status);
+    renderStatus(status, { syncForms: false });
     await loadMonitorLog();
   } catch {
   }
@@ -441,21 +417,22 @@ async function refreshMonitorStatus() {
 
 function wireEvents() {
   $("#refreshStatusBtn").addEventListener("click", loadStatus);
-  $("#loadKeysBtn").addEventListener("click", loadKeys);
-  $("#pairedBtn").addEventListener("click", loadPairedDevices);
-  $("#scanBtn").addEventListener("click", scanBle);
-  $("#testDeviceBtn").addEventListener("click", testDevice);
+  $("#scanBtn").addEventListener("click", scanDevices);
   $("#deleteDeviceBtn").addEventListener("click", deleteDevice);
+  $("#closeDeviceDialogBtn").addEventListener("click", closeDeviceDialog);
+  $("#deviceDialog").addEventListener("click", (event) => {
+    if (event.target.id === "deviceDialog") closeDeviceDialog();
+  });
   $("#deviceForm").addEventListener("submit", saveDevice);
   $("#credentialForm").addEventListener("submit", saveCredential);
   $("#installProviderBtn").addEventListener("click", (event) => providerAction("/api/provider/install", event.currentTarget));
   $("#uninstallProviderBtn").addEventListener("click", (event) => providerAction("/api/provider/uninstall", event.currentTarget));
   $("#startMonitorBtn").addEventListener("click", startMonitor);
   $("#stopMonitorBtn").addEventListener("click", stopMonitor);
+  $("#startupToggle").addEventListener("change", (event) => setStartup(event.currentTarget.checked, event.currentTarget));
 }
 
 wireEvents();
-updateSelectedDevice();
 loadStatus().catch(error => toast(error.message, "bad"));
 setInterval(loadMonitorLog, 3000);
 setInterval(refreshMonitorStatus, 1000);

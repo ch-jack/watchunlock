@@ -299,6 +299,10 @@ label span {
   overflow: hidden;
 }
 
+.startup-toggle {
+  margin-top: 10px;
+}
+
 .signal-card.near {
   border-color: #b9dfc6;
   background: #f0fbf3;
@@ -340,6 +344,70 @@ label span {
   display: grid;
   gap: 8px;
   min-height: 38px;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 20;
+  padding: 20px;
+  background: rgba(15, 23, 42, .42);
+}
+
+.modal[hidden] {
+  display: none;
+}
+
+.modal-panel {
+  width: min(860px, 100%);
+  max-height: min(760px, calc(100vh - 40px));
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 22px 70px rgba(15, 23, 42, .28);
+  padding: 14px;
+}
+
+.device-list {
+  align-content: start;
+}
+
+.device-option {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  min-height: 0;
+  padding: 10px;
+  border-color: var(--line);
+  background: #fbfcfe;
+  color: var(--text);
+  text-align: left;
+}
+
+.device-option:hover {
+  border-color: var(--accent);
+  background: #f4f7ff;
+}
+
+.device-option.ready {
+  border-color: #b9dfc6;
+  background: #f0fbf3;
+}
+
+.device-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.device-top strong {
+  display: block;
+  font-weight: 650;
+  overflow-wrap: anywhere;
 }
 
 .item {
