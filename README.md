@@ -147,3 +147,14 @@ watchunlock.cmd uninstall-provider
 Apple 设备会使用 BLE 隐私地址并定期轮换，所以 iPhone / Apple Watch 需要 IRK 才能稳定识别。`keys` 读取 IRK 的注册表位置通常需要管理员或 SYSTEM 权限：
 
 `HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Keys`
+
+## Native BLE Monitor
+
+PowerShell/WinRT can create a BLE watcher, but on some Windows builds it does not reliably receive advertisement events. The recommended monitor is now the native C++ executable:
+
+```cmd
+native-monitor\build.cmd
+native-monitor\bin\x64\watchunlock-native.exe scan-test --seconds 8
+```
+
+After the native monitor is built, both `web.cmd` and `watchunlock.cmd monitor` automatically prefer `native-monitor\bin\x64\watchunlock-native.exe`. The PowerShell monitor remains as a fallback when the native executable is not present.

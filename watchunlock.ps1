@@ -48,7 +48,8 @@ Common options:
   -Irk <hex>             16-byte IRK as 32 hex chars. Separators are allowed.
   -Seconds <n>           Scan duration. Default: 20 for scan, 60 for resolve.
   -RssiMin <dbm>         Ignore advertisements weaker than this. Default: -100.
-  -Active                Use active BLE scanning. Default is passive scanning.
+  -Active                Use active BLE scanning. This is the default.
+  -Passive               Use passive BLE scanning for diagnostics.
   -Json                  Emit JSON instead of table/log lines.
   -Config <path>         Config path. Default: $DefaultConfigPath
 
@@ -228,11 +229,12 @@ function Convert-HexToBytes {
 }
 
 function Convert-BytesToHex {
-    param([byte[]]$Bytes)
+    param($Bytes)
     if ($null -eq $Bytes) {
         return ""
     }
-    return (($Bytes | ForEach-Object { $_.ToString("X2") }) -join "")
+    $source = [byte[]]@($Bytes)
+    return (($source | ForEach-Object { $_.ToString("X2") }) -join "")
 }
 
 function Format-BluetoothAddress {
@@ -422,7 +424,7 @@ function Get-RegistryPairedBluetoothDevices {
 }
 
 function Start-BleWatcher {
-    param([string]$SourceIdentifier, [bool]$Active = $false)
+    param([string]$SourceIdentifier, [bool]$Active = $true)
 
     Ensure-BluetoothRuntime
     $watcher = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher]::new()
@@ -571,6 +573,27 @@ function Join-Bytes {
     return $result
 }
 
+function Reverse-Bytes {
+    param($Bytes)
+    if ($null -eq $Bytes) {
+        return New-Object byte[] 0
+    }
+    $source = [byte[]]@($Bytes)
+    if ($source.Length -eq 0) {
+        return New-Object byte[] 0
+    }
+    $result = New-Object byte[] $source.Length
+    for ($i = 0; $i -lt $source.Length; $i++) {
+        $result[$i] = $source[$source.Length - 1 - $i]
+    }
+    return $result
+}
+
+function New-ZeroBytes {
+    param([int]$Length)
+    return New-Object byte[] $Length
+}
+
 function Resolve-RpaAddress {
     param(
         [Parameter(Mandatory = $true)][string]$Address,
@@ -578,45 +601,72 @@ function Resolve-RpaAddress {
     )
 
     $addressHex = Normalize-Hex -Value $Address -Bytes 6 -Label "Bluetooth address"
-    $addr = Convert-HexToBytes -Hex $addressHex
-    $keys = @($Irk, @($Irk[15..0]))
-
-    $layouts = @(
-        @{ Name = "prand-high/hash-low"; PrandStart = 0; HashStart = 3; RpaByte = 0 },
-        @{ Name = "hash-high/prand-low"; PrandStart = 3; HashStart = 0; RpaByte = 3 }
+    $addrOriginal = Convert-HexToBytes -Hex $addressHex
+    $keys = @(
+        @{ Name = "key"; Bytes = [byte[]]$Irk },
+        @{ Name = "reversed-key"; Bytes = Reverse-Bytes -Bytes $Irk }
     )
 
-    foreach ($layout in $layouts) {
-        $marker = $addr[$layout.RpaByte] -band 0xC0
-        if ($marker -ne 0x40) {
-            continue
-        }
+    $addressCandidates = @(
+        @{ Name = "display"; Bytes = [byte[]]$addrOriginal },
+        @{ Name = "reversed-address"; Bytes = Reverse-Bytes -Bytes $addrOriginal }
+    )
 
-        $prand = Get-SubBytes -Bytes $addr -Start $layout.PrandStart -Length 3
-        $observedHash = Get-SubBytes -Bytes $addr -Start $layout.HashStart -Length 3
-
-        $blocks = @(
-            @{ Name = "tail-prand"; Block = Join-Bytes -Left (New-Object byte[] 13) -Right $prand },
-            @{ Name = "head-prand"; Block = Join-Bytes -Left $prand -Right (New-Object byte[] 13) }
+    foreach ($addressCandidate in $addressCandidates) {
+        $addr = [byte[]]$addressCandidate.Bytes
+        $layouts = @(
+            @{ Name = "hash-high/prand-low"; Prand = (Get-SubBytes -Bytes $addr -Start 3 -Length 3); Hash = (Get-SubBytes -Bytes $addr -Start 0 -Length 3); RpaByte = 3 },
+            @{ Name = "prand-high/hash-low"; Prand = (Get-SubBytes -Bytes $addr -Start 0 -Length 3); Hash = (Get-SubBytes -Bytes $addr -Start 3 -Length 3); RpaByte = 0 }
         )
 
-        foreach ($keyCandidate in $keys) {
-            $keyName = if (Test-ByteArrayEqual -Left $keyCandidate -Right $Irk) { "key" } else { "reversed-key" }
-            foreach ($blockCandidate in $blocks) {
-                $encrypted = Invoke-AesBlock -Key ([byte[]]$keyCandidate) -Block ([byte[]]$blockCandidate.Block)
-                $hashes = @(
-                    @{ Name = "tail-hash"; Hash = Get-SubBytes -Bytes $encrypted -Start 13 -Length 3 },
-                    @{ Name = "head-hash"; Hash = Get-SubBytes -Bytes $encrypted -Start 0 -Length 3 }
-                )
+        foreach ($layout in $layouts) {
+            $marker = $addr[$layout.RpaByte] -band 0xC0
+            if ($marker -ne 0x40) {
+                continue
+            }
 
-                foreach ($hashCandidate in $hashes) {
-                    if (Test-ByteArrayEqual -Left ([byte[]]$hashCandidate.Hash) -Right $observedHash) {
-                        return [pscustomobject]@{
-                            matched   = $true
-                            layout    = $layout.Name
-                            keyOrder  = $keyName
-                            blockMode = $blockCandidate.Name
-                            hashMode  = $hashCandidate.Name
+            $prandRaw = [byte[]]$layout.Prand
+            $hashRaw = [byte[]]$layout.Hash
+            $prands = @(
+                @{ Name = "prand"; Bytes = $prandRaw },
+                @{ Name = "reversed-prand"; Bytes = (Reverse-Bytes -Bytes $prandRaw) }
+            )
+            $observedHashes = @(
+                @{ Name = "hash"; Bytes = $hashRaw },
+                @{ Name = "reversed-hash"; Bytes = (Reverse-Bytes -Bytes $hashRaw) }
+            )
+
+            foreach ($keyCandidate in $keys) {
+                foreach ($prandCandidate in $prands) {
+                    $blocks = @(
+                        @{ Name = "tail-prand"; Block = Join-Bytes -Left (New-ZeroBytes -Length 13) -Right ([byte[]]$prandCandidate.Bytes) },
+                        @{ Name = "head-prand"; Block = Join-Bytes -Left ([byte[]]$prandCandidate.Bytes) -Right (New-ZeroBytes -Length 13) }
+                    )
+
+                    foreach ($blockCandidate in $blocks) {
+                        $encrypted = Invoke-AesBlock -Key ([byte[]]$keyCandidate.Bytes) -Block ([byte[]]$blockCandidate.Block)
+                        $hashes = @(
+                            @{ Name = "tail-hash"; Hash = Get-SubBytes -Bytes $encrypted -Start 13 -Length 3 },
+                            @{ Name = "reversed-tail-hash"; Hash = Reverse-Bytes -Bytes (Get-SubBytes -Bytes $encrypted -Start 13 -Length 3) },
+                            @{ Name = "head-hash"; Hash = Get-SubBytes -Bytes $encrypted -Start 0 -Length 3 },
+                            @{ Name = "reversed-head-hash"; Hash = Reverse-Bytes -Bytes (Get-SubBytes -Bytes $encrypted -Start 0 -Length 3) }
+                        )
+
+                        foreach ($hashCandidate in $hashes) {
+                            foreach ($observedHash in $observedHashes) {
+                                if (Test-ByteArrayEqual -Left ([byte[]]$hashCandidate.Hash) -Right ([byte[]]$observedHash.Bytes)) {
+                                    return [pscustomobject]@{
+                                        matched      = $true
+                                        addressOrder = $addressCandidate.Name
+                                        layout       = $layout.Name
+                                        keyOrder     = $keyCandidate.Name
+                                        prandOrder   = $prandCandidate.Name
+                                        blockMode    = $blockCandidate.Name
+                                        hashMode     = $hashCandidate.Name
+                                        observedHash = $observedHash.Name
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -625,11 +675,14 @@ function Resolve-RpaAddress {
     }
 
     return [pscustomobject]@{
-        matched   = $false
-        layout    = ""
-        keyOrder  = ""
-        blockMode = ""
-        hashMode  = ""
+        matched      = $false
+        addressOrder = ""
+        layout       = ""
+        keyOrder     = ""
+        prandOrder   = ""
+        blockMode    = ""
+        hashMode     = ""
+        observedHash = ""
     }
 }
 
@@ -837,7 +890,8 @@ function Invoke-ScanCommand {
     $rssiMin = Get-IntOption -Options $Options -Names @("rssimin", "rssi-min") -Default -100
     $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
     $continuous = Get-BoolOption -Options $Options -Names @("continuous") -Default $false
-    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
+    $passive = Get-BoolOption -Options $Options -Names @("passive") -Default $false
+    $active = (Get-BoolOption -Options $Options -Names @("active") -Default $true) -and -not $passive
     $sourceId = "watchunlock-scan-$([Guid]::NewGuid().ToString("N"))"
     $watcherInfo = $null
     $seen = @{}
@@ -890,7 +944,8 @@ function Invoke-ScanTestCommand {
 
     $seconds = Get-IntOption -Options $Options -Names @("seconds", "s") -Default 10
     $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
-    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
+    $passive = Get-BoolOption -Options $Options -Names @("passive") -Default $false
+    $active = (Get-BoolOption -Options $Options -Names @("active") -Default $true) -and -not $passive
     Ensure-BluetoothRuntime
 
     $watcher = [Windows.Devices.Bluetooth.Advertisement.BluetoothLEAdvertisementWatcher]::new()
@@ -1062,7 +1117,8 @@ function Invoke-ResolveCommand {
     $seconds = Get-IntOption -Options $Options -Names @("seconds", "s") -Default 60
     $rssiMin = Get-IntOption -Options $Options -Names @("rssimin", "rssi-min") -Default -100
     $json = Get-BoolOption -Options $Options -Names @("json") -Default $false
-    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
+    $passive = Get-BoolOption -Options $Options -Names @("passive") -Default $false
+    $active = (Get-BoolOption -Options $Options -Names @("active") -Default $true) -and -not $passive
     $sourceId = "watchunlock-resolve-$([Guid]::NewGuid().ToString("N"))"
     $watcherInfo = $null
     $seen = @{}
@@ -1264,6 +1320,7 @@ catch {
     catch {
         if ($json) {
             Write-Output "[]"
+            return
         }
         $adminText = if (Test-IsAdministrator) { "yes" } else { "no" }
         Write-Error ("Cannot run SYSTEM IRK reader. IsAdministrator={0}. Start this command/web UI from an elevated Administrator terminal, and stop any old non-admin web server first. Reason: {1}" -f $adminText, $_.Exception.Message)
@@ -1430,7 +1487,8 @@ function Invoke-MonitorCommand {
     $unlockWindowSeconds = Get-IntOption -Options $Options -Names @("unlockwindow", "unlock-window") -Default ([int](Get-ConfigValue -Config $config -Name "unlockWindowSeconds" -Default 30))
     $statePath = Get-StringOption -Options $Options -Names @("state", "statepath", "state-path") -Default ([string](Get-ConfigValue -Config $config -Name "statePath" -Default $DefaultStatePath))
     $signalStatePath = Get-StringOption -Options $Options -Names @("signalstate", "signal-state", "signalstatepath", "signal-state-path") -Default $statePath
-    $active = Get-BoolOption -Options $Options -Names @("active") -Default $false
+    $passive = Get-BoolOption -Options $Options -Names @("passive") -Default $false
+    $active = (Get-BoolOption -Options $Options -Names @("active") -Default $true) -and -not $passive
     $once = Get-BoolOption -Options $Options -Names @("once") -Default $false
     $logFile = Get-StringOption -Options $Options -Names @("logfile", "log-file") -Default $null
 
@@ -1559,12 +1617,20 @@ function Invoke-SelfTestCommand {
     $block = Join-Bytes -Left (New-Object byte[] 13) -Right $prand
     $encrypted = Invoke-AesBlock -Key $irk -Block $block
     $hash = Get-SubBytes -Bytes $encrypted -Start 13 -Length 3
-    $addrBytes = Join-Bytes -Left $prand -Right $hash
-    $address = Convert-BytesToHex -Bytes $addrBytes
-    $match = Resolve-RpaAddress -Address $address -Irk $irk
+    $prandHash = Join-Bytes -Left $prand -Right $hash
+    $hashPrand = Join-Bytes -Left $hash -Right $prand
+    $reversedHashPrand = Reverse-Bytes -Bytes $hashPrand
+    $addresses = @(
+        (Convert-BytesToHex -Bytes $prandHash),
+        (Convert-BytesToHex -Bytes $hashPrand),
+        (Convert-BytesToHex -Bytes $reversedHashPrand)
+    )
 
-    if (-not $match.matched) {
-        throw "RPA resolver self-test failed."
+    foreach ($address in $addresses) {
+        $match = Resolve-RpaAddress -Address $address -Irk $irk
+        if (-not $match.matched) {
+            throw "RPA resolver self-test failed for address $address."
+        }
     }
 
     Ensure-BluetoothRuntime

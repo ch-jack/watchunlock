@@ -4,4 +4,6 @@
 Thumbs.db
 credential-provider/bin/
 credential-provider/*.obj
+native-monitor/bin/
+native-monitor/*.obj
 web/.runtime/

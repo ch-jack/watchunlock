@@ -12,6 +12,7 @@ const rootDir = path.resolve(__dirname, "..");
 const publicDir = path.join(__dirname, "public");
 const runtimeDir = path.join(__dirname, ".runtime");
 const psScript = path.join(rootDir, "watchunlock.ps1");
+const nativeMonitorExe = path.join(rootDir, "native-monitor", "bin", "x64", "watchunlock-native.exe");
 const providerDll = path.join(rootDir, "credential-provider", "bin", "x64", "WatchUnlockCredentialProvider.dll");
 const dataRoot = path.join(process.env.ProgramData || path.join(process.env.APPDATA || rootDir, "WatchUnlockCli"), "WatchUnlockCli");
 const configPath = path.join(dataRoot, "config.json");
@@ -106,6 +107,10 @@ function runWatchUnlock(args, options = {}) {
     psScript,
     ...args,
   ], options);
+}
+
+function runNativeMonitor(args, options = {}) {
+  return runCommand(nativeMonitorExe, args, options);
 }
 
 function parseJsonOutput(result, fallback = null) {
@@ -220,20 +225,32 @@ function startMonitor() {
   }
   appendLogHeader();
   try { fs.unlinkSync(monitorSignalPath); } catch {}
-  const args = [
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    psScript,
-    "monitor",
-    "-LogFile",
-    monitorLogPath,
-    "-SignalStatePath",
-    monitorSignalPath,
-  ];
-  appendMonitorLogLine(`[web][monitor] spawn powershell.exe ${args.map(arg => `"${arg}"`).join(" ")}`);
-  const child = spawn("powershell.exe", args, {
+  const useNative = fs.existsSync(nativeMonitorExe);
+  const file = useNative ? nativeMonitorExe : "powershell.exe";
+  const args = useNative
+    ? [
+        "monitor",
+        "--config",
+        configPath,
+        "--log-file",
+        monitorLogPath,
+        "--signal-state",
+        monitorSignalPath,
+      ]
+    : [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        psScript,
+        "monitor",
+        "-LogFile",
+        monitorLogPath,
+        "-SignalStatePath",
+        monitorSignalPath,
+      ];
+  appendMonitorLogLine(`[web][monitor] spawn ${file} ${args.map(arg => `"${arg}"`).join(" ")}`);
+  const child = spawn(file, args, {
     cwd: rootDir,
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -253,7 +270,7 @@ function startMonitor() {
     } catch {}
   });
   fs.writeFileSync(monitorPidPath, String(child.pid), "utf8");
-  return { running: true, pid: child.pid, logPath: monitorLogPath };
+  return { running: true, pid: child.pid, logPath: monitorLogPath, engine: useNative ? "native" : "powershell" };
 }
 
 async function stopMonitor() {
@@ -358,9 +375,12 @@ async function handleApi(req, res, url) {
   if (req.method === "POST" && url.pathname === "/api/scan") {
     const seconds = safeInt(body.seconds, 8, 1, 60);
     const rssiMin = safeInt(body.rssiMin, -100, -127, 0);
-    const result = await runWatchUnlock(["scan", "-Seconds", String(seconds), "-RssiMin", String(rssiMin), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
+    const useNative = fs.existsSync(nativeMonitorExe);
+    const result = useNative
+      ? await runNativeMonitor(["scan", "--seconds", String(seconds), "--rssi-min", String(rssiMin), "--json"], { timeoutMs: (seconds + 8) * 1000 })
+      : await runWatchUnlock(["scan", "-Seconds", String(seconds), "-RssiMin", String(rssiMin), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
     const devices = parseJsonOutput(result, []);
-    sendJson(res, 200, { ok: result.code === 0, devices: Array.isArray(devices) ? devices : [], output: `${result.stdout}${result.stderr}`.trim() });
+    sendJson(res, 200, { ok: result.code === 0, engine: useNative ? "native" : "powershell", devices: Array.isArray(devices) ? devices : [], output: `${result.stdout}${result.stderr}`.trim() });
     return;
   }
 
@@ -371,13 +391,18 @@ async function handleApi(req, res, url) {
       return;
     }
     const seconds = safeInt(body.seconds, 15, 1, 120);
-    let result = await runWatchUnlock(["resolve", "-Irk", irk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
+    const useNative = fs.existsSync(nativeMonitorExe);
+    let result = useNative
+      ? await runNativeMonitor(["resolve", "--irk", irk, "--seconds", String(seconds), "--json"], { timeoutMs: (seconds + 8) * 1000 })
+      : await runWatchUnlock(["resolve", "-Irk", irk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
     let matches = parseJsonOutput(result, []);
     let irkUsed = irk;
     let variant = "normal";
     const reversedIrk = reverseHexBytes(irk);
     if ((!Array.isArray(matches) || matches.length === 0) && reversedIrk.length === 32 && reversedIrk !== irk) {
-      const reversedResult = await runWatchUnlock(["resolve", "-Irk", reversedIrk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
+      const reversedResult = useNative
+        ? await runNativeMonitor(["resolve", "--irk", reversedIrk, "--seconds", String(seconds), "--json"], { timeoutMs: (seconds + 8) * 1000 })
+        : await runWatchUnlock(["resolve", "-Irk", reversedIrk, "-Seconds", String(seconds), "-Json"], { timeoutMs: (seconds + 8) * 1000 });
       const reversedMatches = parseJsonOutput(reversedResult, []);
       if (Array.isArray(reversedMatches) && reversedMatches.length > 0) {
         result = reversedResult;
@@ -388,6 +413,7 @@ async function handleApi(req, res, url) {
     }
     sendJson(res, 200, {
       ok: result.code === 0,
+      engine: useNative ? "native" : "powershell",
       matches: Array.isArray(matches) ? matches : [],
       irkUsed,
       variant,
