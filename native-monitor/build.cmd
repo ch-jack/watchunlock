@@ -35,6 +35,7 @@ for /f "delims=" %%I in ('"%VSWHERE%" -latest -products * -requires Microsoft.Vi
 if not defined VCVARS (
   for /f "delims=" %%I in ('"%VSWHERE%" -latest -products * -find VC\Auxiliary\Build\vcvars64.bat') do set "VCVARS=%%I"
 )
+if not defined VCVARS if exist "D:\Microsoft Visual Studio\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=D:\Microsoft Visual Studio\VC\Auxiliary\Build\vcvars64.bat"
 if not defined VCVARS (
   echo cl.exe was not found.
   echo Install the "Desktop development with C++" workload and Windows SDK.

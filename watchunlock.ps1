@@ -809,6 +809,53 @@ function Protect-TextForMachine {
     }
 }
 
+function Test-WindowsCredential {
+    param(
+        [Parameter(Mandatory = $true)][string]$Username,
+        [Parameter(Mandatory = $true)][string]$Password
+    )
+
+    if (-not ("WatchUnlock.NativeLogon" -as [type])) {
+        Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace WatchUnlock {
+    public static class NativeLogon {
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool LogonUser(string username, string domain, string password, int logonType, int logonProvider, out IntPtr token);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr handle);
+    }
+}
+"@
+    }
+
+    $domain = $null
+    $user = $Username
+    if ($Username -match "^([^\\]+)\\(.+)$") {
+        $domain = $Matches[1]
+        $user = $Matches[2]
+    }
+
+    $token = [IntPtr]::Zero
+    $ok = [WatchUnlock.NativeLogon]::LogonUser($user, $domain, $Password, 2, 0, [ref]$token)
+    $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($token -ne [IntPtr]::Zero) {
+        [void][WatchUnlock.NativeLogon]::CloseHandle($token)
+    }
+
+    [pscustomobject]@{
+        ok        = [bool]$ok
+        username  = $Username
+        domain    = $domain
+        user      = $user
+        errorCode = if ($ok) { 0 } else { $errorCode }
+        message   = if ($ok) { "OK" } else { ([ComponentModel.Win32Exception]$errorCode).Message }
+    }
+}
+
 function Get-UnixTimeSeconds {
     $epoch = [DateTime]"1970-01-01T00:00:00Z"
     return [int64](([DateTime]::UtcNow - $epoch).TotalSeconds)
@@ -1427,6 +1474,14 @@ function Invoke-SetCredentialCommand {
     Save-ConfigMap -Map $settings -Path $configPath
     Write-Host "Saved encrypted credential config: $configPath"
     Write-Host "Username: $username"
+    $validation = Test-WindowsCredential -Username $username -Password $password
+    if ($validation.ok) {
+        Write-Host "Credential validation: OK"
+    }
+    else {
+        Write-Host ("Credential validation: FAILED ({0}) {1}" -f $validation.errorCode, $validation.message)
+        Write-Host "If this is a Microsoft account, use the account password, not Windows Hello PIN. Passwordless Microsoft accounts may need password sign-in re-enabled."
+    }
     Write-Host "Password: encrypted with Windows DPAPI LocalMachine scope"
 }
 

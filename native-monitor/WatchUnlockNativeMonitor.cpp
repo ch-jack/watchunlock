@@ -264,14 +264,15 @@ static bool ReadTextFile(const std::wstring& path, std::wstring& text)
 static bool WriteTextFile(const std::wstring& path, const std::wstring& text)
 {
     EnsureParentFolder(path);
-    const int bytesNeeded = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (bytesNeeded <= 1)
+    const int bytesNeeded = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (bytesNeeded <= 0)
     {
         return false;
     }
 
-    std::vector<char> bytes(static_cast<size_t>(bytesNeeded - 1));
-    if (!WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, bytes.data(), bytesNeeded, nullptr, nullptr))
+    std::vector<char> bytes(static_cast<size_t>(bytesNeeded));
+    if (bytesNeeded > 0 &&
+        !WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), bytes.data(), bytesNeeded, nullptr, nullptr))
     {
         return false;
     }
@@ -297,14 +298,15 @@ static bool AppendTextFile(const std::wstring& path, const std::wstring& text)
     }
 
     EnsureParentFolder(path);
-    const int bytesNeeded = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (bytesNeeded <= 1)
+    const int bytesNeeded = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (bytesNeeded <= 0)
     {
         return false;
     }
 
-    std::vector<char> bytes(static_cast<size_t>(bytesNeeded - 1));
-    if (!WideCharToMultiByte(CP_UTF8, 0, text.c_str(), -1, bytes.data(), bytesNeeded, nullptr, nullptr))
+    std::vector<char> bytes(static_cast<size_t>(bytesNeeded));
+    if (bytesNeeded > 0 &&
+        !WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), bytes.data(), bytesNeeded, nullptr, nullptr))
     {
         return false;
     }
